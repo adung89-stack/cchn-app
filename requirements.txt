@@ -1,0 +1,6 @@
+PySide6
+duckdb
+pandas
+openpyxl
+requests
+beautifulsoup4

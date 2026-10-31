@@ -1,0 +1,18 @@
+# KHÔNG đưa dữ liệu lên GitHub (có họ tên, số CCHN)
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.parquet
+*.csv
+*.xls
+*.xlsx
+ban_luu_cchn/
+data/
+_cchn_tmp_*/
+*_log.txt
+cchn_gui_crash.txt
+__pycache__/
+build/
+dist/
+*.spec
