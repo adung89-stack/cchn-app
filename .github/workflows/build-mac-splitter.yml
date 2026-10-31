@@ -1,0 +1,43 @@
+name: Build macOS app (DB Splitter)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest      # Mac chip Apple Silicon (M1/M2/M3/M4)
+            arch: apple-silicon
+          - runner: macos-15-intel    # Mac chip Intel
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-splitter.txt pyinstaller
+
+      - name: Build app
+        run: |
+          pyinstaller --noconfirm --windowed --name DBSplitter \
+            --collect-all duckdb --collect-all python_calamine \
+            universal_db_splitter_qt_gop.py
+
+      - name: Zip app
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent DBSplitter.app ../DBSplitter-${{ matrix.arch }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DBSplitter-${{ matrix.arch }}
+          path: DBSplitter-${{ matrix.arch }}.zip
