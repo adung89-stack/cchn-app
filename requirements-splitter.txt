@@ -1,0 +1,7 @@
+PySide6
+duckdb
+pandas
+pyarrow
+openpyxl
+xlrd
+python-calamine
