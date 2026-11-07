@@ -36,7 +36,7 @@ nhằm để quét toàn bộ danh bạ — chỉ để xác thực đúng nhữ
 liệu đang xử lý.
 """
 from __future__ import annotations
-import re,time,threading,json,ssl
+import re,time,threading,json,ssl,os
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED
 from dataclasses import dataclass,field
@@ -84,12 +84,35 @@ WEB1_FALLBACK_DELAY_SECONDS=10.0
 # trình — mỗi lần mở lại app phải tra mạng lại từ đầu. Cache ra đĩa này giúp nhiều lần chạy
 # GẦN NHAU (cùng 1 buổi làm việc, xử lý nhiều file .db liên tiếp, hoặc chạy lại trong 1-2 ngày
 # kế tiếp) không phải tra lại các mã đã biết — giảm trực tiếp số request thật sự cần bắn lên
-# cổng, bất kể ngưỡng an toàn kỹ thuật là bao nhiêu. TTL 48 giờ (không phải vài giờ) vì CCHN
+# cổng, bất kể ngưỡng an toàn kỹ thuật là bao nhiêu. TTL dài (xem CACHE_TTL_SECONDS) vì CCHN
 # của 1 người hiếm khi đổi trong vài ngày; chỉ áp dụng cho bản ghi found=True (xem
 # save_disk_cached) nên rủi ro dùng nhầm dữ liệu đã lỗi thời là rất thấp so với lợi ích giảm
 # tải lên cổng tra cứu.
-CACHE_FILE=Path.home()/'.general_data_processor_medinet_cache.json'
-CACHE_TTL_SECONDS=48*3600
+# Cache nằm trong thư mục con 'medinet' của thư mục data (cạnh file nguồn .db — xem
+# data.gdp_workdir); app.py gọi set_cache_dir(source.workdir) mỗi khi mở nguồn. Chưa mở nguồn
+# thì dùng <thư mục chương trình>/data/medinet. File cache cũ ở thư mục home (bản trước) được
+# tự chuyển vào đây lần đầu dùng.
+_LEGACY_CACHE_FILE=Path.home()/'.general_data_processor_medinet_cache.json'
+_cache_dir=Path(__file__).resolve().parent/'data'/'medinet'
+def set_cache_dir(workdir):
+    global _cache_dir
+    try:_cache_dir=Path(workdir)/'medinet'
+    except Exception:pass
+def cache_file():
+    d=_cache_dir
+    f=d/'medinet_cache.json'
+    try:
+        d.mkdir(parents=True,exist_ok=True)
+        if not f.exists() and _LEGACY_CACHE_FILE.exists():
+            try:_LEGACY_CACHE_FILE.replace(f)
+            except Exception:
+                import shutil;shutil.copy2(_LEGACY_CACHE_FILE,f)
+    except Exception:pass
+    return f
+# TTL 30 ngày (trước đây 48 giờ): chỉ cache bản ghi found=True, CCHN/nơi công tác hiếm khi đổi
+# trong vài tuần; đặt GDP_MEDINET_CACHE_DAYS để đổi.
+try:CACHE_TTL_SECONDS=float(os.environ.get('GDP_MEDINET_CACHE_DAYS') or 30)*86400
+except Exception:CACHE_TTL_SECONDS=30*86400
 
 TRACUU_BASE='https://tracuu.medinet.org.vn'
 THONGTIN_BASE='https://thongtin.medinet.org.vn'
@@ -340,6 +363,7 @@ class PractitionerRecord:
                              # (nghĩa là tra được, nhưng trang xác nhận không có mã này)
     scope:str=''            # "Phạm vi chuyên môn" đăng ký với SYT (web 1: danh sách theo cơ sở hoặc trang chi tiết)
     position:str=''         # Vị trí hành nghề (danh sách theo cơ sở)
+    nationality:str=''      # Quốc tịch (chỉ để xuất Excel bản lưu)
 
 @lru_cache(maxsize=None)
 def _normalize_code(code):
@@ -363,27 +387,20 @@ def _normalize_doctor_code(raw):
     if raw is None:return ''
     s=re.sub(r'\s+','',str(raw)).upper()
     return '' if s in _BLANK_DOCTOR_CODE_TOKENS else s
-_DOCTOR_CELL_CACHE={}
-def _split_doctor_cell(raw):
-    """Tách 1 ô mã bác sĩ lấy từ .db thành các (mã chuẩn hoá, mã thô) ĐỘC LẬP. Ô có thể chứa NHIỀU mã ngăn cách
-    bằng ';' (vd '003199/HCM-GPHN;002455/HCM-GPHN') — mỗi mã là 1 người riêng, tra cứu riêng. Ô 1 mã -> tuple 1 phần tử
-    (đúng như hành vi cũ); ô trống/giá trị lỗi -> tuple rỗng."""
-    if isinstance(raw,str):
-        v=_DOCTOR_CELL_CACHE.get(raw)
-        if v is not None:return v
-    out=[]
-    if isinstance(raw,str) and ';' in raw:
-        for part in raw.split(';'):
-            c=_normalize_doctor_code(part)
-            if c:out.append((c,part.strip()))
-    else:
-        c=_normalize_doctor_code(raw)
-        if c:out.append((c,raw))
-    v=tuple(out)
-    if isinstance(raw,str):
-        if len(_DOCTOR_CELL_CACHE)>500000:_DOCTOR_CELL_CACHE.clear()
-        _DOCTOR_CELL_CACHE[raw]=v
-    return v
+def split_doctor_codes(raw):
+    """Tách ô mã (vd '003199/HCM-GPHN;002455/HCM-GPHN') thành các mã ĐỘC LẬP (ngăn bởi ';' hoặc ','),
+    mỗi mã chuẩn hoá bằng _normalize_doctor_code; bỏ mã trống/trùng, giữ thứ tự. Trả list[(mã_chuẩn_hoá, mã_thô)]."""
+    try:
+        if pd is not None and pd.isna(raw):return []
+    except (TypeError,ValueError):
+        pass
+    if raw is None:return []
+    out=[];seen=set()
+    for piece in re.split(r'[;,]',str(raw)):
+        c=_normalize_doctor_code(piece)
+        if c and c not in seen:
+            seen.add(c);out.append((c,piece.strip()))
+    return out
 def _clean_text(text):
     return re.sub(r'\s+',' ',str(text or '').replace('\xa0',' ')).strip()
 @lru_cache(maxsize=None)
@@ -423,6 +440,101 @@ def parse_weekly_schedule(text):
                 if day==d2:break
                 day=(day+1)%7
     return schedule
+
+# ---------------------------------------------------------------------------
+# Lịch làm việc mở rộng: chỉ ghi thứ / "từ thứ này đến thứ kia" = làm NGUYÊN NGÀY đó; giờ lấy theo
+# "Thời gian hoạt động" của cơ sở (xem parse_facility_hours / resolve_facility_hours).
+# ---------------------------------------------------------------------------
+_DAY_TOK=r'(?:t2|t3|t4|t5|t6|t7|cn|tcn)'
+_FULL_DAY=(dtime(0,0),dtime(23,59))
+def _day_idx(tok):
+    tok=tok.lower()
+    return _WEEKDAY_MAP['CN' if tok=='tcn' else tok.upper()]
+def _norm_days_text(text):
+    t=_clean_text(text).lower()
+    t=re.sub(r'ch(?:ủ|u)\s*nh(?:ậ|a)t','cn',t)
+    for w,n in (('hai','2'),('ba','3'),('tư','4'),('tu','4'),('bốn','4'),('năm','5'),('sáu','6'),('bảy','7'),('bay','7')):
+        t=re.sub(r'th(?:ứ|u)\s+'+w+r'\b','t'+n,t)
+    t=re.sub(r'th(?:ứ|u)\s*([2-7])',r't\1',t)
+    return t
+def _days_of(spec):
+    """'t2 -> t6' / 't2 đến t7' / 't2' / 't2, t4' -> danh sách chỉ số thứ."""
+    m=re.search(r'('+_DAY_TOK+r')\s*(?:->|-|–|đến|den|tới)\s*('+_DAY_TOK+')',spec)
+    if m:
+        d1,d2=_day_idx(m.group(1)),_day_idx(m.group(2))
+        out=[d1]
+        while out[-1]!=d2 and len(out)<8:out.append((out[-1]+1)%7)
+        return out
+    return list(dict.fromkeys(_day_idx(x) for x in re.findall(r'\b('+_DAY_TOK+r')\b',spec)))
+_TIME_RX=re.compile(r'(?<![\w:])(\d{1,2})\s*(?:giờ|gio|h|:)\s*(\d{0,2})')
+def _times_of(rest):
+    out=[]
+    for m in _TIME_RX.finditer(rest):
+        h=int(m.group(1));mi=int(m.group(2) or 0)
+        if h>24 or mi>59:continue
+        out.append(dtime(h%24,mi))
+    return out
+def parse_schedule_ex(text):
+    """Lịch làm việc -> {thứ: [(bắt đầu|None, kết thúc|None), ...]}. None = chưa có giờ => lấy theo giờ hoạt động của cơ sở:
+       'T2: 7:00 -> 16:30'  -> (7:00,16:30)    'T2:' / 'T2' / 'T2 -> T6' -> (None,None) nguyên ngày
+       'CN: 07:30'          -> (7:30,None)     (từ giờ đó đến hết giờ hoạt động)
+    Chuỗi trống hoặc không nhận được thứ nào -> {} (giữ hành vi cũ: coi như không có lịch)."""
+    t=_norm_days_text(text)
+    out={}
+    for part in re.split(r'[;\n]+',t):
+        part=part.strip(' .,')
+        if not part:continue
+        m=re.match(r'^(?:từ\s+)?((?:'+_DAY_TOK+r'(?:\s*(?:->|-|–|đến|den|tới|,|và)\s*)?)+)\s*[:,]?\s*(.*)$',part)
+        if not m:continue
+        days=_days_of(m.group(1))
+        if not days:continue
+        times=_times_of(m.group(2))
+        if len(times)>=2:win=(times[0],times[1])
+        elif len(times)==1:win=(times[0],None)
+        else:win=(None,None)
+        for d in days:out.setdefault(d,[]).append(win)
+    if out:return out
+    old=parse_weekly_schedule(text)
+    return {d:list(w) for d,w in old.items()}
+
+def parse_facility_hours(text):
+    """"Thời gian hoạt động" của cơ sở -> 'ALL' (toàn thời gian/24h) | {thứ: [(bắt đầu,kết thúc)]} | None (không ghi/không đọc được).
+    Vd 'TỪ THỨ 2 ĐẾN THỨ 7: TỪ 07 GIỜ 30 ĐẾN 21 GIỜ; CHỦ NHẬT: TỪ 07 GIỜ 30 ĐẾN 18 GIỜ'."""
+    raw=_clean_text(text)
+    if not raw:return None
+    low=raw.lower()
+    if re.search(r'to(?:à|a)n\s*th(?:ờ|o)i\s*gian|24\s*/\s*24|24\s*(?:giờ|h)\s*/\s*(?:ngày|ngay)|c(?:ả|a)\s*ng(?:à|a)y\s*l(?:ẫ|a)n\s*(?:đ|d)(?:ê|e)m',low) and not _times_of(low):return 'ALL'
+    t=_norm_days_text(raw)
+    out={}
+    for part in re.split(r'[;\n]+',t):
+        part=part.strip()
+        if not part:continue
+        times=_times_of(part)
+        if len(times)<2:continue
+        _m0=_TIME_RX.search(part)
+        head=part[:_m0.start()] if _m0 else part
+        days=_days_of(head) or list(range(7))
+        for d in days:out.setdefault(d,[]).append((times[0],times[1]))
+    return out or None
+
+_FAC_HOURS={}      # {gphd chuẩn hoá: 'ALL' | {thứ:[(s,e)]} | None}  (None = đã tra nhưng cơ sở không ghi giờ)
+_FACILITY_META={}  # {gphd chuẩn hoá: {'name','hours', ...}}
+def set_facility_hours(gphd,hours_text):
+    _FAC_HOURS[_normalize_code(gphd)]=parse_facility_hours(hours_text)
+    _FACILITY_META.setdefault(_normalize_code(gphd),{})['hours']=hours_text or ''
+def facility_info(gphd):
+    return dict(_FACILITY_META.get(_normalize_code(gphd)) or {})
+def _fac_day_window(gphd,wd):
+    """Khung giờ hoạt động của cơ sở trong thứ wd -> (bắt đầu, kết thúc) hoặc cả ngày nếu không biết."""
+    h=_FAC_HOURS.get(_normalize_code(gphd))
+    if h=='ALL' or not h:return _FULL_DAY
+    ws=h.get(wd)
+    if not ws:return _FULL_DAY
+    return (min(a for a,_ in ws),max(b for _,b in ws))
+def _resolve_window(win,gphd,wd):
+    s,e=win
+    fs,fe=_fac_day_window(gphd,wd)
+    return (s if s is not None else fs, e if e is not None else fe)
 def find_facility_workplace(record,gphd,check_dt=None):
     """Chọn Workplace phù hợp nhất để HIỂN THỊ (Ngày làm việc/Ngày nghỉ việc/Thời gian làm
     việc/Vị trí/Khoa) khi 1 người có thể có NHIỀU dòng "Nơi công tác" tại cùng 1 giấy phép
@@ -477,9 +589,9 @@ def verify_at_facility_detailed(record,gphd,check_dt):
         end_d=parse_vn_date(w.ngay_nghi)
         if start_d and check_date<start_d:continue
         if end_d and check_date>end_d:continue
-        schedule=parse_weekly_schedule(w.thoi_gian)
+        schedule=parse_schedule_ex(w.thoi_gian)
         wd=check_dt.weekday()
-        windows=schedule.get(wd,[])
+        windows=[_resolve_window(x,gphd,wd) for x in schedule.get(wd,[])]
         t=check_dt.time()
         if any(s<=t<=e for s,e in windows):return ('x','','')
         best=('wrong_time',check_dt.strftime('%H:%M'),'') if windows else ('wrong_day','',_WEEKDAY_LABEL[wd])
@@ -492,6 +604,7 @@ NOTE_FIXED={
     'sai_thu':'Có mã, phù hợp nơi công tác, đúng thời gian hành nghề, nhưng thứ không có trong lịch đăng ký.',
     'sai_gio':'Đúng thứ nhưng sai khung giờ.',
     'ngoai_bhyt':'Không có trong file nhân viên đăng ký với BHYT.',
+    'loi_mang':'Hãy chạy lại; mã này chưa được kết luận.',
 }
 NOTE_KHONG_DK_SYT={
     # 4 khả năng con của "Không đăng ký với SYT" — xem _classify_no_match_reason.
@@ -500,6 +613,10 @@ NOTE_KHONG_DK_SYT={
     'before_start':'Ngày y lệnh trước ngày bắt đầu đăng ký hành nghề.',
     'after_end':'Ngày y lệnh sau khi nghỉ việc.',
 }
+def _net_error(rec):
+    """Bản ghi tra cứu bị lỗi KỸ THUẬT (kết nối/cổng chặn/thiếu thư viện) — khác 'không tìm thấy' và khác OFFLINE (mã không có trong bản lưu)."""
+    e=str(getattr(rec,'error','') or '')
+    return bool(e) and not e.startswith('OFFLINE')
 def _classify_no_match_reason(disp_record,gphd,check_dt):
     """Chỉ gọi cho loại lỗi 'khong_dk_syt' (verify_at_facility_detailed đã trả 'no_match') —
     xác định rõ ĐÚNG 1 trong 4 lý do con đã thống nhất với người dùng, thay vì gộp chung
@@ -579,6 +696,53 @@ def _tracuu_search(session,cchn):
             status=_clean_text(b.get_text() if b else last.get_text())
         results.append({'uuid':uuid,'name':name,'cchn':cchn_full,'status':status})
     return results
+_SUB_DATE=r'(\d{1,2}/\d{1,2}/\d{4})'
+def _parse_subrow(td,main):
+    """Dòng phụ -> Workplace (kế thừa giấy phép/cơ sở/địa chỉ của dòng chính ngay trên nó)."""
+    txt=_clean_text(td.get_text(' '))
+    if not txt:return None
+    sched=''
+    for sp in td.select('span'):
+        if sp.select_one('i.fa-calendar') or sp.select_one('i[class*="calendar"]'):
+            sched=_clean_text(sp.get_text())
+    m=re.search(r'Ng(?:à|a)y l(?:à|a)m:\s*'+_SUB_DATE,txt)
+    start=m.group(1) if m else ''
+    m=re.search(r'Ng(?:à|a)y ngh(?:ỉ|i):\s*'+_SUB_DATE,txt)
+    end=m.group(1) if m else ''
+    if not sched:
+        # không có span lịch: lấy các đoạn dạng "T2: ..."/"CN: ..." trong ô
+        parts=[x.strip() for x in txt.split(';') if re.match(r'^(?:T[2-7]|CN|TCN)\b',x.strip(),re.I)]
+        sched='; '.join(parts)
+    m=re.search(r'V(?:ị|i) tr(?:í|i):\s*([^;]*)',txt)
+    position=m.group(1).strip() if m else main.position
+    m=re.search(r'Chuy(?:ê|e)n khoa:\s*([^;]*)',txt)
+    khoa=m.group(1).strip() if m else main.khoa
+    if not (start or end or sched):return None
+    return Workplace(gphd=main.gphd,facility_name=main.facility_name,position=position,khoa=khoa,
+        ngay_lam=start,ngay_nghi=end,thoi_gian=sched,address=main.address)
+def _dedupe_and_clip(wps):
+    """Bỏ dòng trùng y hệt; dòng KHÔNG có ngày nghỉ mà phía sau (cùng giấy phép) còn giai đoạn bắt đầu muộn hơn thì chỉ kéo đến trước ngày bắt đầu đó
+    (giai đoạn cũ không được coi là còn hiệu lực đến nay, tránh khớp nhầm giờ của giai đoạn cũ cho ngày thuộc giai đoạn mới)."""
+    seen=set();out=[]
+    for w in wps:
+        k=(_normalize_code(w.gphd),w.ngay_lam,w.ngay_nghi,w.thoi_gian,w.position,w.khoa)
+        if k in seen:continue
+        seen.add(k);out.append(w)
+    if len(out)<2:return out
+    from datetime import timedelta
+    for w in out:
+        if w.ngay_nghi:continue
+        sd=parse_vn_date(w.ngay_lam)
+        if not sd:continue
+        later=[parse_vn_date(o.ngay_lam) for o in out if o is not w and _normalize_code(o.gphd)==_normalize_code(w.gphd)]
+        later=[d for d in later if d and d>sd]
+        if later:
+            w.ngay_nghi=(min(later)-timedelta(days=1)).strftime('%d/%m/%Y')
+    seen=set();res=[]
+    for w in out:   # cắt xong mới có thể trùng nhau
+        k=(_normalize_code(w.gphd),w.ngay_lam,w.ngay_nghi,w.thoi_gian,w.position,w.khoa)
+        if k not in seen:seen.add(k);res.append(w)
+    return res
 def _tracuu_detail(session,uuid):
     resp=session.post(f'{TRACUU_BASE}/chungchihanhngheydetail',
         headers={'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest','Accept':'*/*','Accept-Language':'vi-VN,vi;q=0.9,en-US;q=0.6,en;q=0.5',
@@ -598,9 +762,15 @@ def _tracuu_detail(session,uuid):
     workplaces=[]
     table=soup.select_one('table.table-bordered')
     if table:
+        last_main=None
         for tr in table.select('tbody tr'):
             tds=tr.find_all('td')
-            if len(tds)<6:continue
+            if len(tds)<6:
+                # Dòng PHỤ (2 ô, ô thứ 2 gộp cột): các giai đoạn làm việc KHÁC của cùng 1 nơi công tác (Ngày làm/Ngày nghỉ/Vị trí/lịch ghi trong 1 ô)
+                if len(tds)>=2 and last_main is not None:
+                    sw=_parse_subrow(tds[-1],last_main)
+                    if sw is not None:workplaces.append(sw)
+                continue
             gphd=facility=position=khoa=''
             for d in tds[1].find_all('div'):
                 txt=_clean_text(d.get_text())
@@ -612,9 +782,11 @@ def _tracuu_detail(session,uuid):
                 if m:position=m.group(1).strip()
                 m=re.match(r'Khoa:\s*(.*)',txt)
                 if m:khoa=m.group(1).strip()
-            workplaces.append(Workplace(gphd=gphd,facility_name=facility,position=position,khoa=khoa,
+            last_main=Workplace(gphd=gphd,facility_name=facility,position=position,khoa=khoa,
                 ngay_lam=_clean_text(tds[2].get_text()),ngay_nghi=_clean_text(tds[3].get_text()),
-                thoi_gian=_clean_text(tds[4].get_text()),address=_clean_text(tds[5].get_text())))
+                thoi_gian=_clean_text(tds[4].get_text()),address=_clean_text(tds[5].get_text()))
+            workplaces.append(last_main)
+    workplaces=_dedupe_and_clip(workplaces)
     return name,cchn,status,workplaces,scope
 def lookup_tracuu(session,cchn):
     try:
@@ -692,6 +864,21 @@ def _facility_macoso(session,uuid):
     soup=BeautifulSoup(resp.text,'html.parser')
     el=soup.select_one('input[name="macoso"]')
     return el.get('value','') if el else ''
+def _facility_detail(session,uuid):
+    """Trang chi tiết cơ sở -> (macoso, {nhãn chuẩn: giá trị}) gồm 'hours' (Thời gian hoạt động), 'address', 'status', 'form', 'kind'."""
+    resp=session.get(f'{TRACUU_BASE}/detail/{uuid}',timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    soup=BeautifulSoup(resp.text,'html.parser')
+    el=soup.select_one('input[name="macoso"]')
+    meta={}
+    keys={'thời gian hoạt động':'hours','địa chỉ':'address','tình trạng':'status','hình thức tổ chức':'form','loại hình':'kind'}
+    for sp in soup.select('span.fw-bold'):
+        lab=_clean_text(sp.get_text()).rstrip(':').strip().lower()
+        k=keys.get(lab)
+        if not k or k in meta:continue
+        nxt=sp.find_next_sibling('span')
+        if nxt is not None:meta[k]=_clean_text(nxt.get_text())
+    return (el.get('value','') if el else ''),meta
 def _facility_page(session,uuid,macoso,page):
     resp=session.post(f'{TRACUU_BASE}/api/v1/public/nv_cskcb?page={page}&results_per_page=10',
         headers=_tracuu_json_headers(),json={'page':page,'cosokcb_id':uuid,'text':'','macoso':macoso},timeout=REQUEST_TIMEOUT)
@@ -718,7 +905,75 @@ def facility_objects_to_records(objects,gphd,facility_name='',into=None):
             rec.workplaces.append(wp)
             if scope and scope not in rec.scope:rec.scope=(rec.scope+'; '+scope) if rec.scope else scope
     return out
-def fetch_facility_staff(gphd,log=None,cancelled=None,use_cache=True):
+_FACILITY_SNAPSHOT=''   # đường dẫn bản lưu danh sách nhân sự (syt_store) đang chọn; rỗng = lấy từ mạng như cũ
+_OFFLINE=False
+def set_offline(flag):
+    """Offline hoàn toàn: mọi lệnh gọi mạng (danh sách theo cơ sở, tra lẻ web 1/web 2) bị bỏ qua; chỉ dùng bản lưu."""
+    global _OFFLINE
+    _OFFLINE=bool(flag)
+def configure_from_rule(rule,log=None):
+    """Gọi trước khi chạy mục E/F (dùng chung):
+    - CÓ chọn bản lưu (đã quét hoặc nhập từ Excel): chạy hoàn toàn OFFLINE trên bản đó (không tra mạng), GPHĐ lấy theo bản lưu nếu chưa nhập.
+    - KHÔNG chọn: dùng bản lưu của GPHĐ trong AUTO_DAYS ngày; chưa có thì tự quét 1 bản mới (lưu lại) rồi dùng; quét lỗi thì lấy từ mạng như cũ."""
+    log=log or (lambda m:None)
+    snap=str(getattr(rule,'facility_snapshot','') or '')
+    gphd=str(getattr(rule,'facility_gphd','') or '').strip()
+    try:
+        import syt_store
+    except Exception:
+        syt_store=None
+    if not snap and gphd and syt_store is not None:
+        try:
+            path,err,fresh=syt_store.ensure_recent(gphd,log=log)
+            if path:snap=path
+            elif err:log(f'⚠ Không tạo được bản lưu tự động ({err}) — lấy danh sách từ mạng.')
+        except Exception as e:
+            log(f'⚠ Không tạo được bản lưu tự động ({e}) — lấy danh sách từ mạng.')
+        explicit=False
+    else:
+        explicit=bool(snap)
+    set_facility_snapshot(snap)
+    set_offline(explicit)
+    if snap and not gphd and syt_store is not None:
+        try:
+            meta,_=syt_store.load_snapshot(snap)
+            rule.facility_gphd=str(meta.get('gphd','') or '')
+        except Exception:pass
+    if snap and syt_store is not None:
+        try:
+            meta,_=syt_store.load_snapshot(snap)
+            if 'hours' in meta:
+                k=_normalize_code(meta.get('gphd',''))
+                _FAC_HOURS[k]=parse_facility_hours(meta.get('hours',''))
+                _FACILITY_META[k]=dict(meta,name=meta.get('facility_name',''))
+        except Exception:pass
+    return snap
+_HOURS_TRIED=set()
+def resolve_facility_hours(gphd,log=None):
+    """Bảo đảm biết "Thời gian hoạt động" của cơ sở: chưa biết hoặc cơ sở không ghi => tra lại trang cơ sở trên web 1 (mỗi cơ sở 1 lần/lượt chạy, bỏ qua khi offline).
+    Vẫn không có => coi như làm nguyên ngày (xem _fac_day_window)."""
+    log=log or (lambda m:None)
+    key=_normalize_code(gphd)
+    if not key or _FAC_HOURS.get(key):return
+    if _OFFLINE or key in _HOURS_TRIED or requests is None or BeautifulSoup is None:return
+    _HOURS_TRIED.add(key)
+    sess=_new_session()
+    try:
+        uuid,name=_retry_transient(_facility_find,sess,gphd)
+        _m,fmeta=_retry_transient(_facility_detail,sess,uuid)
+        _FACILITY_META[key]=dict(_FACILITY_META.get(key) or {},**fmeta,name=name)
+        _FAC_HOURS[key]=parse_facility_hours(fmeta.get('hours',''))
+        log('Giờ hoạt động của cơ sở: '+(fmeta.get('hours') or 'cơ sở không ghi — coi như làm nguyên ngày'))
+    except Exception as e:
+        log(f'⚠ Không tra lại được giờ hoạt động của cơ sở ({e}) — coi như làm nguyên ngày.')
+    finally:
+        try:sess.close()
+        except Exception:pass
+def set_facility_snapshot(path):
+    """Chọn bản lưu dùng cho fetch_facility_staff (UI/tác vụ gọi trước khi chạy). Rỗng/None = không dùng bản lưu."""
+    global _FACILITY_SNAPSHOT
+    _FACILITY_SNAPSHOT=str(path or '')
+def fetch_facility_staff(gphd,log=None,cancelled=None,use_cache=True,snapshot=None,ignore_snapshot=False):
     """Lấy TOÀN BỘ danh sách nhân sự của cơ sở có số giấy phép `gphd` từ web 1. Trả về
     (records, error): records = {mã chuẩn hoá: PractitionerRecord}; error = '' nếu thành công.
     Kết quả được giữ trong bộ nhớ FACILITY_CACHE_TTL giây để Preview/Export liên tiếp khỏi lấy lại."""
@@ -726,6 +981,23 @@ def fetch_facility_staff(gphd,log=None,cancelled=None,use_cache=True):
     cancelled=cancelled or (lambda:False)
     key=_normalize_code(gphd)
     if not key:return {},'Chưa nhập số giấy phép hoạt động của cơ sở.'
+    snap=_FACILITY_SNAPSHOT if snapshot is None else snapshot
+    if snap and not ignore_snapshot:
+        # Có bản lưu trên máy => dùng luôn, KHÔNG tra mạng (danh mục cơ sở hiếm khi đổi; muốn cập nhật thì quét bản mới).
+        try:
+            import syt_store
+            meta,recs=syt_store.load_snapshot(snap)
+            if _normalize_code(meta.get('gphd',''))==key:
+                if 'hours' in meta:
+                    _FAC_HOURS[key]=parse_facility_hours(meta.get('hours',''))
+                    _FACILITY_META[key]=dict(meta,name=meta.get('facility_name',''))
+                log(f'Dùng bản lưu danh sách nhân sự cơ sở {gphd} ({syt_store.label(dict(meta,count=len(recs)))}) — không tra mạng.')
+                return recs,''
+            log(f'⚠ Bản lưu đang chọn thuộc GPHĐ khác ({meta.get("gphd","")}) — bỏ qua, lấy từ mạng.')
+        except Exception as e:
+            log(f'⚠ Không đọc được bản lưu: {e} — lấy từ mạng.')
+    if _OFFLINE and not ignore_snapshot:
+        return {},'OFFLINE: bản lưu đã chọn không khớp GPHĐ của cơ sở (hoặc không đọc được) — không kết nối mạng.'
     if requests is None or BeautifulSoup is None:
         return {},'Thiếu thư viện requests/beautifulsoup4.'
     with _FACILITY_LOCK:
@@ -741,7 +1013,9 @@ def fetch_facility_staff(gphd,log=None,cancelled=None,use_cache=True):
     try:
         log(f'Đang lấy danh sách nhân sự của cơ sở {gphd} từ web 1 (tracuu.medinet.org.vn)...')
         uuid,name=_retry_transient(_facility_find,sess,gphd)
-        macoso=_retry_transient(_facility_macoso,sess,uuid)
+        macoso,fmeta=_retry_transient(_facility_detail,sess,uuid)
+        _FACILITY_META[key]=dict(fmeta,name=name)
+        _FAC_HOURS[key]=parse_facility_hours(fmeta.get('hours',''))
         first=_retry_transient(_facility_page,sess,uuid,macoso,1)
         total=int(first.get('total_pages') or 1)
         records={}
@@ -777,6 +1051,9 @@ def fill_records_chain(codes,records,log=None,cancelled=None):
     cancelled=cancelled or (lambda:False)
     codes=list(dict.fromkeys(codes))
     if not codes:return
+    if _OFFLINE:
+        log(f'OFFLINE: bỏ qua tra cứu bổ sung {len(codes)} mã chưa có trong bản lưu (không kết nối mạng).')
+        return
     old=dict((c,records[c]) for c in codes if c in records)
     got1=load_disk_cached(codes,'web1')
     for c,r in got1.items():records[c]=r
@@ -961,29 +1238,32 @@ class LookupCache:
 # --- Cache tra cứu ra đĩa: hàm đọc/ghi -------------------------------------------------
 def _record_to_jsonable(r):
     return {'found':r.found,'source':r.source,'name':r.name,'cchn':r.cchn,'status':r.status,'error':r.error,
-        'scope':r.scope,'position':r.position,
+        'scope':r.scope,'position':r.position,'nationality':r.nationality,
         'workplaces':[{'gphd':w.gphd,'facility_name':w.facility_name,'position':w.position,'khoa':w.khoa,
             'ngay_lam':w.ngay_lam,'ngay_nghi':w.ngay_nghi,'thoi_gian':w.thoi_gian,'address':w.address}
             for w in r.workplaces]}
 def _record_from_jsonable(d):
     return PractitionerRecord(found=d.get('found',False),source=d.get('source',''),name=d.get('name',''),
         cchn=d.get('cchn',''),status=d.get('status',''),error=d.get('error',''),
-        scope=d.get('scope',''),position=d.get('position',''),
+        scope=d.get('scope',''),position=d.get('position',''),nationality=d.get('nationality',''),
         workplaces=[Workplace(**w) for w in d.get('workplaces') or []])
 
+DISK_FMT=2
 _disk_cache_lock=threading.Lock()
 def _read_disk_cache():
     try:
-        if CACHE_FILE.exists():
-            return json.loads(CACHE_FILE.read_text(encoding='utf-8'))
+        f=cache_file()
+        if f.exists():
+            return json.loads(f.read_text(encoding='utf-8'))
     except Exception:
         pass
     return {}
 def _write_disk_cache(raw):
     try:
-        tmp=CACHE_FILE.with_suffix('.tmp')
+        f=cache_file()
+        tmp=f.with_suffix('.tmp')
         tmp.write_text(json.dumps(raw,ensure_ascii=False),encoding='utf-8')
-        tmp.replace(CACHE_FILE)
+        tmp.replace(f)
     except Exception:
         pass  # cache ra đĩa chỉ là tối ưu tốc độ, không được phép làm hỏng lượt tra cứu
 
@@ -997,7 +1277,7 @@ def load_disk_cached(codes,which):
     out={}
     for code in codes:
         entry=raw.get(code)
-        if not entry or (now-entry.get('ts',0))>=CACHE_TTL_SECONDS:continue
+        if not entry or (now-entry.get('ts',0))>=CACHE_TTL_SECONDS or entry.get('fmt',1)<DISK_FMT:continue  # fmt<2: bản cũ chưa đọc các dòng giai đoạn phụ
         rd=entry.get(which)
         if rd is None:continue
         try:out[code]=_record_from_jsonable(rd)
@@ -1012,7 +1292,7 @@ def save_disk_cached(records,which):
     tìm thấy"), vì đây có thể chỉ là 1 lần tra bị trục trặc tạm thời (rớt mạng giữa chừng,
     trang tạm thời không trả kết quả tìm kiếm...) chứ không chắc là trang THỰC SỰ không có mã
     này — nếu lỡ cache nhầm 1 lần "không tìm thấy" như vậy, các lượt chạy SAU trong 6 giờ tới
-    sẽ cứ dùng lại kết quả sai đó thay vì thử tra lại. Ưu tiên tra lại (chấp nhận chậm hơn
+    sẽ cứ dùng lại kết quả sai đó (trong thời hạn cache) thay vì thử tra lại. Ưu tiên tra lại (chấp nhận chậm hơn
     1 chút) hơn là có nguy cơ báo sai "Không đăng ký với SYT" cho 1 mã THỰC SỰ có đăng ký."""
     usable={c:r for c,r in records.items() if not r.error and r.found}
     if not usable:return
@@ -1022,6 +1302,7 @@ def save_disk_cached(records,which):
         for code,rec in usable.items():
             entry=raw.get(code) or {}
             entry['ts']=now
+            entry['fmt']=DISK_FMT
             entry[which]=_record_to_jsonable(rec)
             raw[code]=entry
         _write_disk_cache(raw)
@@ -1085,6 +1366,9 @@ class MedinetVerifyRule:
                                  # này chỉ còn ý nghĩa với nhánh cũ _pipeline_fetch_web2_then_web1.
     scope_sheet:bool=True  # thêm sheet "PHAM_VI_DK_SYT" đối chiếu phạm vi đăng ký SYT với chi phí trong XML
     kho_file:str=''        # file kho gợi ý (kho_goi_y_*.xlsx) — sheet 'MA_CP DVKT' cho chương chuyên môn của DVKT
+    loai_kcb:list=field(default_factory=list)  # chỉ xét các dòng có MA_LOAI_KCB thuộc danh sách này (vd ['01','03']); RỖNG = xuất hết, không lọc
+    facility_snapshot:str=''  # đường dẫn bản lưu danh sách nhân sự cơ sở (syt_store); rỗng = lấy từ mạng như cũ
+    syt_offline:bool=False  # offline hoàn toàn: chỉ dùng bản lưu, không gọi mạng (xem configure_from_rule)
 
 REASON_LABELS={
     # ĐÚNG 4 loại lỗi (theo file mẫu m_u_2.xlsx đã chốt) — mỗi loại được kiểm tra ĐỘC LẬP
@@ -1110,12 +1394,14 @@ REASON_LABELS={
     'sai_gio':'Sai giờ làm việc',
     'sai_thu':'Sai thứ làm việc',
     'khong_dk_syt':'Không đăng ký với SYT',
+    'loi_mang':'Chưa tra cứu được (lỗi mạng)',   # không kết nối/không tra được cổng SYT — KHÔNG kết luận sai, cần chạy lại
 }
 REASON_EXPLAIN={  # "Giải thích lỗi" — nguyên văn cố định theo file mẫu, không đổi theo dữ liệu
     'ngoai_bhyt':'không có trong file nhân viên',
     'sai_gio':'Giờ làm việc không đăng ký trên cổng',
     'sai_thu':'Ngày làm việc không đăng ký trên cổng',
     'khong_dk_syt':'Không có CCHN tra cứu trên SYT',
+    'loi_mang':'Không kết nối được cổng SYT nên chưa kiểm tra được',
 }
 REASON_SHEET=dict(REASON_LABELS)  # tên sheet chi tiết = ĐÚNG tên "Loại lỗi" (người dùng đã xác nhận)
 # Các cột LẤY NGUYÊN VẸN từ .db gốc cho sheet chi tiết (chỉ lấy cột nào THỰC SỰ có trong dữ
@@ -1123,9 +1409,9 @@ REASON_SHEET=dict(REASON_LABELS)  # tên sheet chi tiết = ĐÚNG tên "Loại 
 # tiết = các cột này + 3 cột tính toán (NGAY_LAM_VIEC/NGAY_NGHI_VIEC/THOI_GIAN_LAM_VIEC) +
 # 1 cột giá trị cụ thể (giờ/thứ chính xác của dòng đó) — RIÊNG 'ngoai_bhyt'/'khong_dk_syt'
 # KHÔNG có cột giá trị cụ thể này (không phải vấn đề giờ/thứ cụ thể).
-DETAIL_BASE_COLUMNS=['XML1_ID','KY_QT','MA_CSKCB','MA_LK','MA_BN','HO_TEN','MA_THE','NGAY_VAO','NGAY_RA',
+DETAIL_BASE_COLUMNS=['XML1_ID','KY_QT','MA_CSKCB','MA_LOAI_KCB','MA_LK','MA_BN','HO_TEN','MA_THE','NGAY_VAO','NGAY_RA',
     'MA_BENH','MA_BENHKHAC','ID_CP','LOAI_CP','MA_CP','MA_NHOM','TEN_CP','SO_DANG_KY','SO_LUONG','DON_GIA',
-    'THANH_TIEN','TYLE_TT','NGAY_YL','T_BHTT_DTL','MUC_HUONG_DTL','MA_BAC_SI','NGAY_TH_YL','MA_BSI_THUC_HIEN']
+    'THANH_TIEN','TYLE_TT','NGAY_YL','T_BHTT_DTL','MUC_HUONG_DTL','MA_BAC_SI','NGAY_TH_YL','MA_BSI_THUC_HIEN','MA_KHOA','TEN_KHOA']
 def _parse_vn_number(val):
     """Chuyển 1 giá trị số kiểu Việt Nam (.db có thể lưu dạng text, dấu phẩy là thập phân,
     dấu chấm là phân cách nghìn) thành float, để CỘNG DỒN đúng cho THANH_TIEN/T_BHTT_DTL ở
@@ -1220,6 +1506,19 @@ def load_staff_dir_raw_map(path,key_column):
             out[norm]=s
     return out
 
+# 10 mã loại hình khám bệnh, chữa bệnh (MA_LOAI_KCB) — dùng cho ô chọn ở mục F
+LOAI_KCB_LABELS=[('01','Khám bệnh'),('02','Điều trị ngoại trú'),('03','Điều trị nội trú'),('04','Điều trị nội trú ban ngày'),
+    ('05','Điều trị ngoại trú các bệnh mạn tính dài ngày liên tục trong năm (TT 46/2016/TT-BYT), có khám bệnh và lĩnh thuốc'),
+    ('06','Điều trị lưu tại Trạm Y tế tuyến xã, Phòng khám đa khoa khu vực'),('07','Nhận thuốc theo hẹn (không khám bệnh)'),
+    ('08','Điều trị ngoại trú các bệnh mạn tính dài ngày (TT 46/2016/TT-BYT), có khám bệnh, có thực hiện DVKT và/hoặc sử dụng thuốc'),
+    ('09','Điều trị nội trú dưới 04 giờ'),('10','Các trường hợp khác')]
+def kcb_codes(rule):
+    """Tập mã loại KCB đã chọn, chuẩn hoá về số nguyên (rỗng = không lọc)."""
+    out=[]
+    for v in getattr(rule,'loai_kcb',None) or []:
+        try:out.append(int(float(str(v).strip())))
+        except ValueError:pass
+    return sorted(set(out))
 def medinet_lookup_columns(rule):
     """Trả về danh sách các cột (mã bác sĩ + thời gian của cặp nào đang bật, bỏ trùng) cần
     thiết TỐI THIỂU để đối chiếu CCHN — dùng để giới hạn truy vấn .db chỉ lấy đúng các cột
@@ -1555,7 +1854,13 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
     pair_dts={}
     for pi,(_,_,doc_col,time_col) in enumerate(pairs):
         if doc_col not in df.columns or time_col not in df.columns:continue
-        pair_codes[pi]=df[doc_col].map(_split_doctor_cell).to_numpy()
+        _col=df[doc_col];_cache={}
+        def _sp(v,_cache=_cache):
+            k=v if isinstance(v,str) else repr(v)
+            r=_cache.get(k)
+            if r is None:r=_cache[k]=tuple(split_doctor_codes(v))
+            return r
+        pair_codes[pi]=pd.Series([_sp(v) for v in _col.to_numpy(dtype=object)],dtype=object).to_numpy()
         pair_dts[pi]=pd.to_datetime(df[time_col],errors='coerce').to_numpy()
 
     # Xây map mã -> danh sách mọi check_dt mã đó xuất hiện cùng trong df, trong 1 lượt quét
@@ -1566,11 +1871,11 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
     for pi in pair_codes:
         codes_arr=pair_codes[pi]
         dts_arr=pair_dts[pi]
-        for code_items,dt in zip(codes_arr,dts_arr):
-            if not code_items or pd.isna(dt):continue
-            dt_py=pd.Timestamp(dt).to_pydatetime()
-            for code in dict.fromkeys(c for c,_ in code_items):
-                code_to_dts.setdefault(code,[]).append(dt_py)
+        for items,dt in zip(codes_arr,dts_arr):
+            if not items or pd.isna(dt):continue
+            _d=pd.Timestamp(dt).to_pydatetime()
+            for code,_ in items:
+                code_to_dts.setdefault(code,[]).append(_d)
 
     # Thứ tự nguồn (mới): danh sách nhân sự theo cơ sở (đã nạp ở prefetch_staff_records, hoặc nạp ở
     # đây nếu chưa có) -> mã thiếu/chưa xác nhận được: tra lẻ web 1 (1 mã/giây) -> lỗi: web 2.
@@ -1579,6 +1884,7 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
         if err:log(f'⚠ {err} — chuyển sang tra lẻ từng mã.')
         for c,r in fac.items():
             if c not in records1:records1[c]=r
+    if rule.facility_gphd and not cancelled():resolve_facility_hours(rule.facility_gphd,log=log)
     missing1=sorted(c for c in code_to_dts if c not in records1)
     recheck=[]
     if rule.facility_gphd:
@@ -1590,8 +1896,8 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
         recheck=sorted(recheck)
     todo=missing1+recheck
     if todo and not cancelled():
-        if missing1:log(f'Có {len(missing1)} mã chưa có dữ liệu (không có trong danh sách theo cơ sở/danh mục nhân viên) — tra lẻ web 1 (1 mã/giây), lỗi thì web 2...')
-        if recheck:log(f'Có {len(recheck)} mã trong danh sách theo cơ sở chưa xác nhận được ở thời điểm đang xét (danh sách chỉ ghi giai đoạn hiện hành) — tra lẻ web 1 để lấy đủ lịch sử, lỗi thì web 2...')
+        if missing1 and not _OFFLINE:log(f'Có {len(missing1)} mã chưa có dữ liệu (không có trong danh sách theo cơ sở/danh mục nhân viên) — tra lẻ web 1 (1 mã/giây), lỗi thì web 2...')
+        if recheck and not _OFFLINE:log(f'Có {len(recheck)} mã trong danh sách theo cơ sở chưa xác nhận được ở thời điểm đang xét (danh sách chỉ ghi giai đoạn hiện hành) — tra lẻ web 1 để lấy đủ lịch sử, lỗi thì web 2...')
         fill_records_chain(todo,records1,log=log,cancelled=cancelled)
         for c in recheck:
             r=records1.get(c)
@@ -1609,7 +1915,7 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
     groups={}       # (pi,code,cat) -> {'code_raw','wp','disp_record','sum_thanh_tien','sum_tbhtt','min_dt','max_dt','thu_set'}
     both_sides={}   # (pi,code) -> {'bhyt':bool,'syt':bool} — để biết dòng nào cần tô đậm (vướng CẢ 2 phía)
     detail_rows={}  # sheet_name -> list of {'idx','NGAY_LAM_VIEC','NGAY_NGHI_VIEC','THOI_GIAN_LAM_VIEC','check_dt','thu','reason_value'} (track_details=True only)
-    error_record=PractitionerRecord(error='Thiếu thư viện requests/beautifulsoup4 — cần cài đặt để dùng tính năng tra cứu này.')
+    error_record=PractitionerRecord(error='OFFLINE: mã không có trong bản lưu danh sách nhân sự (không tra cứu mạng).' if _OFFLINE else 'Thiếu thư viện requests/beautifulsoup4 — cần cài đặt để dùng tính năng tra cứu này.')
     has_thanh_tien='THANH_TIEN' in df.columns
     has_tbhtt='T_BHTT_DTL' in df.columns
     n_rows=len(df)
@@ -1647,8 +1953,8 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
 
     idx_arr=df.index.to_numpy()
     doc_raw_arrs={pi:df[doc_col].to_numpy(dtype=object) for pi,(_,_,doc_col,_) in enumerate(pairs) if pi in pair_codes}
+    bsth_arr=df['MA_BSI_THUC_HIEN'].to_numpy(dtype=object) if 'MA_BSI_THUC_HIEN' in df.columns else None
     thanh_tien_arr=df['THANH_TIEN'].to_numpy() if has_thanh_tien else None
-    msh_arr=df['MA_BSI_THUC_HIEN'].to_numpy(dtype=object) if 'MA_BSI_THUC_HIEN' in df.columns else None   # cột "MA_BSI_THUC_HIEN" của KET_QUA = giá trị cột này trong .db
     tbhtt_arr=df['T_BHTT_DTL'].to_numpy() if has_tbhtt else None
 
     for pos in range(n_rows):
@@ -1658,86 +1964,72 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
         idx=idx_arr[pos]
         for pi,(pair_label,pair_short,doc_col,time_col) in enumerate(pairs):
             if pi not in pair_codes:continue
-            code_items=pair_codes[pi][pos]
-            if not code_items:continue
+            items=pair_codes[pi][pos]
+            if not items:continue
             dt_raw=pair_dts[pi][pos]
             if pd.isna(dt_raw):continue
+            # Cột 'MA_BSI_THUC_HIEN' ở KET_QUA: CHỈ ghi khi chính cột MA_BSI_THUC_HIEN (của cặp này) vi phạm; cặp khác -> để trống.
+            cell_raw=bsth_arr[pos] if (bsth_arr is not None and doc_col=='MA_BSI_THUC_HIEN') else None
             check_dt=pd.Timestamp(dt_raw).to_pydatetime()
-            # Ô có thể chứa NHIỀU mã ngăn cách ';' — mỗi mã tra cứu ĐỘC LẬP; mã nào vi phạm thì dòng .db đó vi phạm
-            # (kể cả các mã còn lại không vi phạm). Gộp theo (cặp, nguyên chuỗi mã, loại lỗi).
-            chain_key=';'.join(dict.fromkeys(c for c,_ in code_items))
-            per_cat={}
-            seen_codes=set()
-            for code,code_raw in code_items:
-                if code in seen_codes:continue
-                seen_codes.add(code)
+            # MỖI mã trong ô (tách bởi ';') được tra ĐỘC LẬP; mã nào vi phạm thì cả dòng vi phạm,
+            # các mã vi phạm CÙNG loại lỗi trong 1 dòng được gom lại thành 1 dòng KET_QUA (ngăn ';').
+            viol={}   # cat -> list of (code,code_raw,disp_record,wp)
+            for code,code_raw in items:
                 # records1 = kết quả web 2 (nguồn chính), records2 = kết quả web 1 (bổ sung).
                 status1,gio1,thu1=_verify_memo_get('1',records1,code,check_dt)
                 record1=records1.get(code,error_record)
                 confirmed=(status1=='x')
                 disp_record,disp_status,disp_gio,disp_thu=record1,status1,gio1,thu1
                 if not confirmed and rule.facility_gphd and code in records2:
-                    # Web 2 không xác nhận được (không có, sai nơi hành nghề, hoặc sai giờ/thứ) —
-                    # đã rà lại web 1 ở Bước 1, dùng luôn kết quả đó cho ĐÚNG thời điểm này.
                     status2,gio2,thu2=_verify_memo_get('2',records2,code,check_dt)
                     if status2=='x':
-                        confirmed=True  # web 1 xác nhận đúng -> bỏ qua, không tính là bất thường phía SYT
+                        confirmed=True
                     elif not record1.found:
-                        # web 2 không có DỮ LIỆU GÌ CẢ -> hiển thị theo web 1 thay vì để trống
                         record2=records2[code]
                         disp_record,disp_status,disp_gio,disp_thu=record2,status2,gio2,thu2
-                    # else: web 2 có dữ liệu (dù sai) -> vẫn hiển thị theo web 2 như cũ, dù
-                    # web 1 cũng sai — chỉ dùng web 1 để XÁC NHẬN LẠI, không thay dữ liệu hiển thị
                 in_staff=code in staff_keys
-                # 2 phía kiểm tra ĐỘC LẬP — 1 dòng .db có thể vướng cả 2, không phải chọn 1:
                 cats=[]
-                if not in_staff:
-                    cats.append('ngoai_bhyt')
+                if staff_keys and not in_staff:cats.append('ngoai_bhyt')   # không có file nhân viên => không xét loại này (đã có 'Không đăng ký với SYT')
                 if not confirmed:
                     if disp_status=='wrong_time':cats.append('sai_gio')
                     elif disp_status=='wrong_day':cats.append('sai_thu')
-                    else:cats.append('khong_dk_syt')  # 'no_match': không có mã / không khớp nơi / ngoài giai đoạn làm-nghỉ
-                if not cats:continue  # mã này ổn cả 2 phía
+                    elif _net_error(record1) or (code in records2 and _net_error(records2[code])):cats.append('loi_mang')   # không tra được vì lỗi mạng => KHÔNG kết luận "không đăng ký"
+                    else:cats.append('khong_dk_syt')
+                if not cats:continue
                 wp=_wp_memo_get(disp_record,check_dt)
                 bs=both_sides.setdefault((pi,code),{'bhyt':False,'syt':False})
                 if 'ngoai_bhyt' in cats:bs['bhyt']=True
                 if any(c in ('sai_gio','sai_thu','khong_dk_syt') for c in cats):bs['syt']=True
                 for cat in cats:
-                    per_cat.setdefault(cat,[]).append((code,code_raw,wp,disp_record,disp_gio,disp_thu))
-            for cat,viol in per_cat.items():
-                key=(pi,chain_key,cat)
+                    rv=disp_gio if cat=='sai_gio' else (disp_thu if cat=='sai_thu' else None)
+                    viol.setdefault(cat,[]).append((code,code_raw,disp_record,wp,rv,disp_thu))
+            for cat,plist in viol.items():
+                key=(pi,cat,tuple(x[0] for x in plist))
                 g=groups.get(key)
                 if g is None:
-                    g={'msh':{},'persons':{},'sum_thanh_tien':0.0,'sum_tbhtt':0.0,
-                       'min_dt':check_dt,'max_dt':check_dt}
+                    g={'persons':[{'code':x[0],'code_raw':x[1],'wp':x[3],'disp_record':x[2],'thu_set':set(),
+                                   'note':_build_note(cat,x[2],rule.facility_gphd,check_dt)} for x in plist],
+                       'raws':[],'sum_thanh_tien':0.0,'sum_tbhtt':0.0,'min_dt':check_dt,'max_dt':check_dt}
                     groups[key]=g
                 else:
                     if check_dt<g['min_dt']:g['min_dt']=check_dt
                     if check_dt>g['max_dt']:g['max_dt']=check_dt
-                if msh_arr is not None:
-                    mv=msh_arr[pos]
-                    if mv is not None and mv==mv:
-                        mv=str(mv).strip()
-                        if mv and mv.upper() not in _BLANK_DOCTOR_CODE_TOKENS:g['msh'][mv]=None
+                rs='' if (cell_raw is None or (not isinstance(cell_raw,str) and pd.isna(cell_raw))) else str(cell_raw).strip()
+                if rs and rs not in g['raws']:g['raws'].append(rs)
                 if has_thanh_tien:g['sum_thanh_tien']+=_parse_vn_number(thanh_tien_arr[pos])
                 if has_tbhtt:g['sum_tbhtt']+=_parse_vn_number(tbhtt_arr[pos])
-                for code,code_raw,wp,disp_record,disp_gio,disp_thu in viol:
-                    pr=g['persons'].get(code)
-                    if pr is None:
-                        # Ghi chú riêng theo ĐÚNG loại lỗi (cat) — xem _build_note; tính 1 lần lúc thấy người này lần đầu trong group.
-                        pr={'code_raw':code_raw,'wp':wp,'disp_record':disp_record,'thu_set':set(),
-                            'note':_build_note(cat,disp_record,rule.facility_gphd,check_dt)}
-                        g['persons'][code]=pr
-                    if cat=='sai_thu' and disp_thu:pr['thu_set'].add(disp_thu)
+                if cat=='sai_thu':
+                    for per,x in zip(g['persons'],plist):
+                        if x[5]:per['thu_set'].add(x[5])
                 if track_details:
                     sheet_name=REASON_SHEET[cat]
-                    rv=[(disp_gio if cat=='sai_gio' else (disp_thu if cat=='sai_thu' else None)) for _,_,_,_,disp_gio,disp_thu in viol]
-                    reason_value=rv[0] if len(rv)==1 else ';'.join(str(x or '') for x in rv)
-                    _j=lambda vals:vals[0] if len(vals)==1 else ';'.join(str(x or '') for x in vals)
+                    rvs=[x[4] for x in plist if x[4]]
                     detail_rows.setdefault(sheet_name,[]).append({
-                        'idx':idx,'NGAY_LAM_VIEC':_j([w.ngay_lam if w else '' for _,_,w,_,_,_ in viol]),
-                        'NGAY_NGHI_VIEC':_j([w.ngay_nghi if w else '' for _,_,w,_,_,_ in viol]),
-                        'THOI_GIAN_LAM_VIEC':_j([w.thoi_gian if w else '' for _,_,w,_,_,_ in viol]),'reason_value':reason_value})
+                        'idx':idx,
+                        'NGAY_LAM_VIEC':'; '.join((x[3].ngay_lam if x[3] else '') for x in plist) if len(plist)>1 else (plist[0][3].ngay_lam if plist[0][3] else ''),
+                        'NGAY_NGHI_VIEC':'; '.join((x[3].ngay_nghi if x[3] else '') for x in plist) if len(plist)>1 else (plist[0][3].ngay_nghi if plist[0][3] else ''),
+                        'THOI_GIAN_LAM_VIEC':'; '.join((x[3].thoi_gian if x[3] else '') for x in plist) if len(plist)>1 else (plist[0][3].thoi_gian if plist[0][3] else ''),
+                        'reason_value':('; '.join(rvs) if len(plist)>1 else plist[0][4])})
 
     def _vai_tro(pi):
         # CHỈ tên vai trò — bỏ phần giải thích trong ngoặc (đó là phần thuyết minh, không
@@ -1758,41 +2050,46 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
             return raw_staff
         s=str(code_raw).strip() if code_raw is not None else ''
         return s if s else code
+    def _explain(cat,P):
+        """Cột 'Giải thích' = giải thích cố định của loại lỗi + chi tiết riêng từng mã (trước đây tách ở 'Giải thích lỗi' và 'Ghi chú')."""
+        base=REASON_EXPLAIN[cat]
+        if cat=='ngoai_bhyt':return base[:1].upper()+base[1:]
+        notes=[]
+        for p in P:
+            n=str(p.get('note') or '').strip()
+            if n and n not in notes:notes.append(n)
+        return base+('. '+' '.join(notes) if notes else '')
     summary_rows=[]
-    for (pi,chain_key,cat),g in groups.items():
-        # người vi phạm theo ĐÚNG thứ tự trong chuỗi mã .db; nhiều người -> các giá trị cách nhau bằng ';'
-        plist=[(c,g['persons'][c]) for c in chain_key.split(';') if c in g['persons']]
-        def _jn(vals):
-            vals=[('' if v is None else str(v)) for v in vals]
-            return vals[0] if len(vals)==1 else ';'.join(vals)
-        thu_txt=[', '.join(sorted(pr['thu_set'],key=lambda t:_WEEKDAY_MAP.get(t,99))) for _,pr in plist]
-        wps=[pr['wp'] for _,pr in plist]
+    def _j(vals):
+        if not any(str(v).strip() for v in vals):return ''
+        return '; '.join(vals) if len(vals)>1 else vals[0]
+    for (pi,cat,_codes),g in groups.items():
+        P=g['persons']
+        bold=any(both_sides.get((pi,p['code']),{}).get('bhyt') and both_sides.get((pi,p['code']),{}).get('syt') for p in P)
         out={
-            'Loại lỗi':REASON_LABELS[cat],
-            'Giải thích lỗi':REASON_EXPLAIN[cat],
+            'Lý do':REASON_LABELS[cat],
+            'Giải thích':_explain(cat,P),
             'Vai trò':_vai_tro(pi),
-            'Chức danh đăng ký BHYT':_jn([_chuc_danh_bhyt_label(staff_chucdanh_map.get(c)) for c,_ in plist]),
-            'Mã người hành nghề':_jn([_ma_hanh_nghe(pr['disp_record'],c,pr['code_raw']) for c,pr in plist]),
-            'Họ tên trên cổng':_jn([pr['disp_record'].name if pr['disp_record'].found else '' for _,pr in plist]),
-            'Lịch đăng ký trên cổng':_jn([w.thoi_gian if w else '' for w in wps]),
-            'Ngày bắt đầu làm việc (cổng)':_jn([w.ngay_lam if w else '' for w in wps]),
-            'Ngày nghỉ việc (cổng)':_jn([w.ngay_nghi if w else '' for w in wps]),
-            'Các thứ ghi nhận':_jn(thu_txt),
+            'Chức danh đăng ký BHYT':_j([_chuc_danh_bhyt_label(staff_chucdanh_map.get(p['code'])) for p in P]),
+            'Mã người hành nghề':_j([_ma_hanh_nghe(p['disp_record'],p['code'],p['code_raw']) for p in P]),
+            'Họ tên trên cổng':_j([p['disp_record'].name if p['disp_record'].found else '' for p in P]),
+            'Lịch đăng ký trên cổng':_j([p['wp'].thoi_gian if p['wp'] else '' for p in P]),
+            'Ngày bắt đầu làm việc (cổng)':_j([p['wp'].ngay_lam if p['wp'] else '' for p in P]),
+            'Ngày nghỉ việc (cổng)':_j([p['wp'].ngay_nghi if p['wp'] else '' for p in P]),
+            'Các thứ ghi nhận':_j([', '.join(sorted(p['thu_set'],key=lambda t:_WEEKDAY_MAP.get(t,99))) for p in P]),
             'Từ ngày':g['min_dt'].strftime('%d/%m/%Y'),
             'Đến ngày':g['max_dt'].strftime('%d/%m/%Y'),
             'Thành tiền':g['sum_thanh_tien'],
             'Tiền BHYT đã thanh toán (đ)':g['sum_tbhtt'],
-            'Ghi chú':_jn([pr.get('note','') for _,pr in plist]),
-            'MA_BSI_THUC_HIEN':(';'.join(g['msh'])[:32000] if pairs[pi][2]=='MA_BSI_THUC_HIEN' else ''),   # giá trị cột MA_BSI_THUC_HIEN trong .db của các dòng vi phạm (khác nhau thì cách nhau ';')
+            'MA_BSI_THUC_HIEN':' | '.join(g['raws']),
             'Giải trình':'',
-            'Lý do':'',
-            '_BOLD':any(both_sides.get((pi,c),{}).get('bhyt',False) and both_sides.get((pi,c),{}).get('syt',False) for c,_ in plist),
+            '_BOLD':bold,
         }
         summary_rows.append(out)
-    summary_cols=['STT','Loại lỗi','Giải thích lỗi','Vai trò','Chức danh đăng ký BHYT','Mã người hành nghề','Họ tên trên cổng',
+    summary_cols=['STT','Lý do','Giải thích','Vai trò','Chức danh đăng ký BHYT','Mã người hành nghề','Họ tên trên cổng',
                   'Lịch đăng ký trên cổng','Ngày bắt đầu làm việc (cổng)','Ngày nghỉ việc (cổng)',
                   'Các thứ ghi nhận','Từ ngày','Đến ngày','Thành tiền','Tiền BHYT đã thanh toán (đ)',
-                  'Ghi chú','MA_BSI_THUC_HIEN','Giải trình','Lý do','_BOLD']
+                  'MA_BSI_THUC_HIEN','Giải trình','_BOLD']
     if summary_rows:
         summary_df=pd.DataFrame(summary_rows)
         summary_df.insert(0,'STT',range(1,len(summary_df)+1))
@@ -1808,8 +2105,15 @@ def combine_with_dataframe(df,rule,staff_keys,records1,records2=None,session=Non
             sub['NGAY_LAM_VIEC']=[r['NGAY_LAM_VIEC'] for r in rows_info]
             sub['NGAY_NGHI_VIEC']=[r['NGAY_NGHI_VIEC'] for r in rows_info]
             sub['THOI_GIAN_LAM_VIEC']=[r['THOI_GIAN_LAM_VIEC'] for r in rows_info]
+            cat_of=[k for k,v in REASON_SHEET.items() if v==sheet_name][0]
+            expl=REASON_EXPLAIN[cat_of][:1].upper()+REASON_EXPLAIN[cat_of][1:]
             if sheet_name in (REASON_LABELS['sai_gio'],REASON_LABELS['sai_thu']):
-                sub[sheet_name]=[r['reason_value'] for r in rows_info]
+                gt=[r['reason_value'] for r in rows_info]
+                lab='giờ' if cat_of=='sai_gio' else 'thứ'
+                sub.insert(0,'Giải thích',[(f'{expl}. Giá trị {lab} ghi nhận: {v}' if v else expl) for v in gt])
+            else:
+                sub.insert(0,'Giải thích',expl)
+            sub.insert(0,'Lý do',REASON_LABELS[cat_of])
             detail_sheets[sheet_name]=sub
             log(f'Sheet "{sheet_name}": {len(sub)} dòng.')
     return summary_df,detail_sheets,records1,records2

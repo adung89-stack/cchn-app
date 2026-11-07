@@ -39,10 +39,9 @@ CONFIG={
     'pair1_on':True,'pair1_doctor':'MA_BAC_SI','pair1_time':'NGAY_YL',
     'pair2_on':None,'pair2_doctor':'MA_BSI_THUC_HIEN','pair2_time':'NGAY_TH_YL',   # None = tự bật nếu .db có đủ 2 cột
     'loai_kcb':[],              # lọc theo MA_LOAI_KCB, vd ['01','03']; để trống = lấy tất cả loại hình KCB
-    'snapshot':'',              # bản lưu danh sách nhân sự cơ sở (file .xlsx hoặc tên) để DÙNG LẠI, khỏi tải web; để trống = tải mới từ web rồi tự lưu thành bản mới
+    'snapshot':'',              # bản lưu danh sách nhân sự cơ sở (đường dẫn .json hoặc tên file) để DÙNG LẠI, khỏi tải web; để trống = dùng bản quét ≤30 ngày của GPHĐ, chưa có thì tự quét bản mới
     'snapshot_dir':'',          # thư mục chứa các bản lưu; để trống = <thư mục chứa cchn_verify.py>/ban_luu_cchn
     'offline':False,            # True = CHỈ dùng bản lưu (--snapshot), KHÔNG kết nối mạng; không cần GPHĐ
-    'snapshot_refresh':False,   # True = có bản lưu nhưng vẫn tải lại danh sách cơ sở từ web để cập nhật thêm vào bản lưu (cần mạng)
     'web1_safe':False,          # True = tra web 1 bổ sung ở tốc độ an toàn (~10s/mã, chậm)
     'log':'',                   # file log; để trống = <file kết quả>_log.txt
     'ssd':False,                # True = dùng nhiều luồng DuckDB hơn (SSD/NVMe)
@@ -331,7 +330,7 @@ def build_rule(cfg,columns):
     if not key:raise ValueError(f'Chưa chọn Cột mã CCHN trong file danh mục nhân viên (--staff-key-col). Các cột: {", ".join(staff_cols)}')
     if key not in staff_cols:raise ValueError(f'File danh mục nhân viên không có cột "{key}". Các cột: {", ".join(staff_cols)}')
     gphd=str(cfg['gphd'] or '').strip()
-    if not gphd:raise ValueError('Chưa nhập số giấy phép bệnh viện (GPHĐ) (--gphd).')
+    if not gphd and not str(cfg.get('snapshot') or '').strip():raise ValueError('Chưa nhập số giấy phép bệnh viện (GPHĐ) (--gphd) hoặc chọn bản lưu.')
     mode=cfg['mode'] if cfg['mode'] in EXPORT_MODES else 'summary'
     return ML.MedinetVerifyRule(enabled=True,pair1_enabled=p1_on,pair1_doctor_column=p1d,pair1_time_column=p1t,
         pair2_enabled=p2_on,pair2_doctor_column=p2d,pair2_time_column=p2t,staff_dir_file=str(sf_path),staff_dir_key_column=key,
@@ -465,21 +464,18 @@ def write_results(rule,output_path,summary_df,detail_sheets):
 # --------------------------------------------------------------------------------------------
 def _run_inner(cfg):
     import medinet_lookup as ML
-    # bổ sung các cột lấy từ .db vào các sheet/file chi tiết, ngay sau MA_LK: MA_LOAI_KCB, MA_KHOA, TEN_KHOA (cột nào .db không có thì bỏ qua)
-    _b=list(ML.DETAIL_BASE_COLUMNS);_pos=_b.index('MA_LK')+1 if 'MA_LK' in _b else len(_b)
-    for _c in (LOAI_KCB_COL,'MA_KHOA','TEN_KHOA'):
-        if _c not in _b:_b.insert(_pos,_c);_pos+=1
-    ML.DETAIL_BASE_COLUMNS=_b
     t0=time.time()
     db=Path(cfg['db'])
     if not str(cfg['db']).strip():raise ValueError('Chưa chọn file nguồn (--db).')
     if not db.exists():raise ValueError(f'Không tìm thấy file nguồn: {db}')
     if db.suffix.lower() not in SUPPORTED:raise ValueError(f'Không hỗ trợ định dạng {db.suffix}. Hỗ trợ: {", ".join(sorted(SUPPORTED))}')
-    # bản lưu danh sách nhân sự: có bản lưu thì KHÔNG bắt buộc nhập GPHĐ (lấy từ bản lưu); offline = không kết nối mạng
+    # bản lưu danh sách nhân sự (syt_store): có bản lưu thì KHÔNG bắt buộc nhập GPHĐ (lấy từ bản lưu); offline = không kết nối mạng
+    import syt_store
+    snapshot_dir(cfg)
     snap=resolve_snapshot(cfg);offline=bool(cfg.get('offline'))
     if offline and snap is None:raise ValueError('Chế độ offline cần chọn 1 bản lưu danh sách nhân sự (--snapshot).')
     if snap is not None and not str(cfg.get('gphd') or '').strip():
-        g0=_read_info(snap).get('GPHD','')
+        g0=(syt_store.read_meta(snap) or {}).get('gphd','')
         if not g0:raise ValueError(f'Bản lưu "{snap.name}" không ghi số GPHĐ — hãy nhập GPHĐ.')
         cfg=dict(cfg,gphd=g0);log(f'GPHĐ lấy từ bản lưu: {g0}')
     if not offline and (ML.requests is None or ML.BeautifulSoup is None):
@@ -513,72 +509,23 @@ def _run_inner(cfg):
     log(f'Tốc độ web 1: {"AN TOÀN (~10s/mã)" if rule.web1_safe_pacing else "nhanh (mặc định)"}')
     needs_detail=rule.export_mode!='summary'
 
-    # --- 2. PHA 1: tra danh mục nhân viên (không đụng .db)
-    # --- 2. nguồn danh sách nhân sự cơ sở: DÙNG LẠI bản lưu (không tải web) hoặc tải mới từ web và LƯU NGAY thành bản lưu
-    state={'path':snap,'info':{}}
-    orig_fetch=ML.fetch_facility_staff;orig_fill=ML.fill_records_chain
-    if snap is not None:
-        snap_recs,snap_info=read_snapshot(snap);state['info']=snap_info
-        sg=ML._normalize_code(snap_info.get('GPHD',''))
-        if sg and sg!=ML._normalize_code(rule.facility_gphd):
-            raise ValueError(f'Bản lưu "{snap.name}" là của cơ sở GPHĐ {snap_info.get("GPHD")} — khác GPHĐ đang nhập ({rule.facility_gphd}). Hãy chọn đúng bản lưu hoặc "tải mới từ web".')
-        log(f'Dùng BẢN LƯU danh sách nhân sự: {snap.name} · {len(snap_recs):,} người · lưu lúc {snap_info.get("NGAY_LUU","?")} — KHÔNG tải lại danh sách từ web.')
-        def _fetch_from_snapshot(gphd,log=None,cancelled=None,use_cache=True):return copy.deepcopy(snap_recs),''
-        ML.fetch_facility_staff=_fetch_from_snapshot
-        if offline:
-            log('⚡ CHẾ ĐỘ OFFLINE: chỉ dùng bản lưu, KHÔNG kết nối mạng (không tải danh sách, không tra lẻ từng mã).')
-            def _offline_fill(codes,records,log=None,cancelled=None):
-                miss=[c for c in dict.fromkeys(codes) if c not in records]
-                for c in miss:records[c]=ML.PractitionerRecord(found=False)
-                (log or globals()['log'])(f'OFFLINE: {len(miss):,} mã không có trong bản lưu — KHÔNG tra web (coi như chưa có dữ liệu, có thể bị báo "Không đăng ký với SYT").')
-            ML.fill_records_chain=_offline_fill
-        elif cfg.get('snapshot_refresh'):
-            def _fetch_refresh(gphd,log=None,cancelled=None,use_cache=True):
-                _l=log or globals()['log']
-                recs,err=orig_fetch(gphd,log=log,cancelled=cancelled,use_cache=False)
-                base=copy.deepcopy(snap_recs)
-                if err or not recs:_l(f'⚠ Không cập nhật được danh sách cơ sở từ web ({err or "rỗng"}) — dùng bản lưu hiện có.');return base,''
-                upd=0
-                for k,r in recs.items():
-                    old=base.get(k)
-                    if old is not None and (old.source in ('tracuu','thongtin') or (old.source=='tracuu_cs_checked' and ML._record_to_jsonable(old)['workplaces']==ML._record_to_jsonable(r)['workplaces'])):continue   # giữ bản đã đủ lịch sử/đã kiểm tra, trừ khi dữ liệu cơ sở đổi
-                    base[k]=r;upd+=1
-                _l(f'Đã cập nhật danh sách cơ sở từ web: {len(recs):,} người ({upd:,} người mới/thay đổi so với bản lưu).')
-                return base,''
-            ML.fetch_facility_staff=_fetch_refresh
-    else:
-        def _fetch_and_save(gphd,log=None,cancelled=None,use_cache=True):
-            recs,err=orig_fetch(gphd,log=log,cancelled=cancelled,use_cache=use_cache)
-            if not err and recs and state['path'] is None:
-                try:
-                    state['path']=save_snapshot(recs,gphd,directory=snapshot_dir(cfg),note='tải từ web (tự lưu)')
-                    state['info']=_read_info(state['path'])
-                    _log=log or globals()['log'];_log(f'Đã LƯU danh sách nhân sự thành bản lưu: {state["path"].name} (lần sau chọn bản này để khỏi tải lại).')
-                except Exception as e:(log or globals()['log'])(f'⚠ Không lưu được bản lưu danh sách nhân sự: {e}')
-            return recs,err
-        ML.fetch_facility_staff=_fetch_and_save
-    records_box={}
-    def _persist():
-        """Ghi thêm các mã vừa tra lẻ được (web 1/web 2) vào bản lưu — lần sau không phải tra lại."""
-        r1=records_box.get('r1')
-        if state['path'] is None or not r1 or offline:return   # offline: không ghi gì vào bản lưu
-        try:
-            info=state['info'] or {}
-            merged,_=read_snapshot(state['path'])
-            new={k:v for k,v in r1.items() if v.found and not v.error and (k not in merged or ML._record_to_jsonable(merged[k])!=ML._record_to_jsonable(v))}
-            if not new:return   # không có gì mới → không ghi lại file
-            merged.update(new)
-            save_snapshot(merged,info.get('GPHD') or rule.facility_gphd,info.get('TEN_CO_SO',''),path=state['path'],note=info.get('GHI_CHU',''),saved_at=info.get('NGAY_LUU',''))
-            log(f'Đã cập nhật bản lưu "{state["path"].name}": thêm/sửa {len(new):,} người (tổng {len(merged):,}).')
-        except Exception as e:log(f'⚠ Không cập nhật được bản lưu: {e}')
+    # --- 2. nguồn danh sách nhân sự cơ sở (logic của app chính, ML.configure_from_rule):
+    #   CÓ chọn bản lưu -> chạy hoàn toàn OFFLINE trên bản đó; KHÔNG chọn -> dùng bản quét ≤30 ngày của GPHĐ, chưa có thì tự quét 1 bản mới và lưu.
+    rule.facility_snapshot=str(snap) if snap is not None else ''
+    rule.syt_offline=bool(offline)
+    try:ML.set_cache_dir(snapshot_dir(cfg))
+    except Exception:pass
+    snap_used=ML.configure_from_rule(rule,log=log)
+    if offline:log('⚡ CHẾ ĐỘ OFFLINE: chỉ dùng bản lưu, KHÔNG kết nối mạng (không tra lẻ từng mã).')
+    if snap_used:
+        _m=syt_store.read_meta(snap_used) or {}
+        log(f'Dùng BẢN LƯU danh sách nhân sự: {Path(snap_used).name} · {_m.get("count","?")} người · quét lúc {_m.get("fetched_at","?")}'+(f' · giờ hoạt động cơ sở: {_m.get("hours") or "cơ sở không ghi"}' if "hours" in _m else ''))
     try:
         log('Đang tra cứu danh mục nhân viên trên cổng tra cứu...')
         t=time.time()
         staff_keys,records1=ML.prefetch_staff_records(rule.staff_dir_file,rule.staff_dir_key_column,progress=make_progress('Tra cứu danh mục'),
                                                        cancelled=cancelled,log=log,facility_gphd=rule.facility_gphd)
-        records_box['r1']=records1
         log(f'Đã tra xong {len(records1)} mã trong danh mục nhân viên ({time.time()-t:.0f}s).')
-        _persist()
         if cancelled():return None
 
         # --- 3. mở .db, lấy dữ liệu cần đối chiếu rồi ĐÓNG
@@ -597,143 +544,81 @@ def _run_inner(cfg):
 
         # --- 4. PHA 2: đối chiếu
         t=time.time()
-        try:
-            summary_df,detail_sheets,records1,records2=ML.combine_with_dataframe(df,rule,staff_keys,records1,records2=None,log=log,cancelled=cancelled,track_details=needs_detail)
-        finally:
-            records_box['r1']=records1;_persist()   # lưu cả khi bị huỷ/lỗi giữa chừng: các mã đã tra được không mất
+        summary_df,detail_sheets,records1,records2=ML.combine_with_dataframe(df,rule,staff_keys,records1,records2=None,log=log,cancelled=cancelled,track_details=needs_detail)
         log(f'Đối chiếu xong ({time.time()-t:.0f}s).')
         if cancelled():return None
     finally:
-        ML.fetch_facility_staff=orig_fetch;ML.fill_records_chain=orig_fill
+        ML.set_offline(False);ML.set_facility_snapshot('')
 
     # --- 5. ghi file
     log('Đang ghi file Excel...')
     counts,files=write_results(rule,out,summary_df,detail_sheets)
     log(f'Hoàn tất — {len(summary_df)} dòng cần rà soát trên {len(counts)} sheet.')
     if len(summary_df):
-        for lab,n in summary_df['Loại lỗi'].value_counts().items():log(f'   • {lab}: {n} dòng')
+        for lab,n in summary_df['Lý do'].value_counts().items():log(f'   • {lab}: {n} dòng')
         nb=int(summary_df['_BOLD'].sum()) if '_BOLD' in summary_df.columns else 0
         if nb:log(f'   • Dòng tô đậm (mã vướng cả BHYT lẫn SYT): {nb}')
     for f in files:log(f'File: {f}')
     log(f'XONG · tổng thời gian {time.time()-t0:.0f}s')
-    return dict(files=[str(f) for f in files],rows=len(summary_df),sheets=counts,log=str(lp),snapshot=str(state['path']) if state['path'] else '')
+    return dict(files=[str(f) for f in files],rows=len(summary_df),sheets=counts,log=str(lp),snapshot=str(snap_used or ''))
 
 
 # --------------------------------------------------------------------------------------------
-# BẢN LƯU DANH SÁCH NHÂN SỰ (Excel) — tải 1 lần, dùng lại nhiều lần để hạn chế truy cập mạng (dễ bị chặn)
+# BẢN LƯU DANH SÁCH NHÂN SỰ — dùng syt_store.py (cùng định dạng với app chính: JSON, nhập/xuất Excel theo mẫu cổng)
+# Tải 1 lần, dùng lại nhiều lần, chạy offline được → hạn chế truy cập mạng (dễ bị chặn)
 # --------------------------------------------------------------------------------------------
-SNAP_SHEET='NHAN_SU';SNAP_INFO='THONG_TIN'
-SNAP_COLS=['MA_TRA_CUU','MA_CCHN','HO_TEN','TRANG_THAI','PHAM_VI_CHUYEN_MON','VI_TRI_HANH_NGHE','NGUON','CO_SO_GPHD','CO_SO_TEN',
-           'NOI_CT_VI_TRI','NOI_CT_KHOA','NGAY_LAM','NGAY_NGHI','THOI_GIAN_LAM_VIEC','DIA_CHI']
 def snapshot_dir(cfg=None):
-    """Thư mục chứa các bản lưu: cfg['snapshot_dir'] hoặc <thư mục chứa file này>/ban_luu_cchn (bản đóng gói: ~/Documents/CCHN/ban_luu_cchn)."""
+    """Thư mục gốc chứa các bản lưu (syt_store lưu vào <thư mục này>/syt_staff): cfg['snapshot_dir'] hoặc <thư mục script>/ban_luu_cchn (không ghi được thì ~/ban_luu_cchn)."""
+    import syt_store
     cands=[]
     if cfg and str(cfg.get('snapshot_dir') or '').strip():cands.append(Path(cfg['snapshot_dir']))
     if getattr(sys,'frozen',False):cands.append(Path.home()/'Documents'/'CCHN'/'ban_luu_cchn')   # bản đóng gói (.app/.exe): không ghi vào bên trong ứng dụng
     cands+=[Path(__file__).resolve().parent/'ban_luu_cchn',Path.home()/'ban_luu_cchn']
     for d in cands:
-        try:d.mkdir(parents=True,exist_ok=True);return d
+        try:
+            d.mkdir(parents=True,exist_ok=True);(d/'.w').write_text('x');(d/'.w').unlink()
+            syt_store.set_base_dir(d);return d
         except Exception:continue
     raise RuntimeError('Không tạo được thư mục chứa bản lưu.')
-def _records_to_frame(records):
-    rows=[]
-    for key,r in records.items():
-        if not getattr(r,'found',False) or getattr(r,'error',''):continue   # chỉ lưu bản ghi tra được thật sự (không lưu "không tìm thấy"/lỗi mạng — tránh dùng lại kết quả sai)
-        base=dict(MA_TRA_CUU=key,MA_CCHN=r.cchn,HO_TEN=r.name,TRANG_THAI=r.status,PHAM_VI_CHUYEN_MON=r.scope,VI_TRI_HANH_NGHE=r.position,NGUON=r.source)
-        wps=r.workplaces or [None]
-        for w in wps:
-            d=dict(base)
-            if w is not None:d.update(CO_SO_GPHD=w.gphd,CO_SO_TEN=w.facility_name,NOI_CT_VI_TRI=w.position,NOI_CT_KHOA=w.khoa,NGAY_LAM=w.ngay_lam,
-                                      NGAY_NGHI=w.ngay_nghi,THOI_GIAN_LAM_VIEC=w.thoi_gian,DIA_CHI=w.address)
-            rows.append(d)
-    return pd.DataFrame(rows,columns=SNAP_COLS).fillna('')
-def _frame_to_records(df):
-    import medinet_lookup as ML
-    out={}
-    for _,row in df.iterrows():
-        g=lambda c:('' if c not in df.columns or pd.isna(row[c]) else str(row[c]).strip())
-        raw=g('MA_CCHN');key=ML._normalize_code(g('MA_TRA_CUU') or raw)
-        if not key:continue
-        rec=out.get(key)
-        if rec is None:
-            rec=out[key]=ML.PractitionerRecord(found=True,source=g('NGUON') or 'tracuu_cs',name=g('HO_TEN'),cchn=raw or key,status=g('TRANG_THAI'),
-                scope=g('PHAM_VI_CHUYEN_MON'),position=g('VI_TRI_HANH_NGHE'),workplaces=[])
-        wp=[g('CO_SO_GPHD'),g('CO_SO_TEN'),g('NOI_CT_VI_TRI'),g('NOI_CT_KHOA'),g('NGAY_LAM'),g('NGAY_NGHI'),g('THOI_GIAN_LAM_VIEC'),g('DIA_CHI')]
-        if any(wp):rec.workplaces.append(ML.Workplace(gphd=wp[0],facility_name=wp[1],position=wp[2],khoa=wp[3],ngay_lam=wp[4],ngay_nghi=wp[5],thoi_gian=wp[6],address=wp[7]))
-    return out
-def save_snapshot(records,gphd,facility_name='',directory=None,path=None,note='',saved_at=''):
-    """Lưu records ra file Excel (sheet NHAN_SU + THONG_TIN). path=None → file mới <GPHĐ>__<ngày giờ>.xlsx. Ghi qua file tạm rồi đổi tên (không hỏng bản cũ nếu lỗi giữa chừng)."""
-    frame=_records_to_frame(records)
-    if frame.empty:raise ValueError('Danh sách nhân sự rỗng — không lưu.')
-    if not facility_name:
-        fn=[x for x in frame['CO_SO_TEN'] if x];facility_name=fn[0] if fn else ''
-    now=datetime.datetime.now()
-    if path is None:
-        d=Path(directory) if directory else snapshot_dir();d.mkdir(parents=True,exist_ok=True)
-        path=d/f'{safe_name(gphd.replace("/","-"),"gphd",60)}__{now:%Y%m%d_%H%M%S}.xlsx'
-    path=Path(path)
-    info=pd.DataFrame({'Mục':['GPHD','TEN_CO_SO','NGAY_LUU','NGAY_CAP_NHAT','SO_NHAN_SU','GHI_CHU'],
-        'Giá trị':[gphd,facility_name,saved_at or f'{now:%Y-%m-%d %H:%M:%S}',f'{now:%Y-%m-%d %H:%M:%S}',str(len(set(frame["MA_TRA_CUU"]))),note]})
-    tmp=path.with_name(path.stem+'.part.xlsx')
-    try:
-        with pd.ExcelWriter(tmp,engine='openpyxl') as w:
-            info.to_excel(w,sheet_name=SNAP_INFO,index=False);frame.to_excel(w,sheet_name=SNAP_SHEET,index=False)
-            for ws in w.sheets.values():_style_header_row(ws,ws.max_column);_autosize_columns(ws,frame if ws.title==SNAP_SHEET else info)
-        tmp.replace(path)
-    finally:
-        if tmp.exists():
-            try:tmp.unlink()
-            except Exception:pass
-    return path
-def _read_info(path):
-    try:
-        df=pd.read_excel(path,sheet_name=SNAP_INFO,dtype=str).fillna('')
-        return {str(a).strip():str(b).strip() for a,b in zip(df.iloc[:,0],df.iloc[:,1])}
-    except Exception:return {}
-def read_snapshot(path):
-    """→ (records, info). Ném ValueError nếu file không đúng định dạng bản lưu."""
-    path=Path(path)
-    if not path.exists():raise ValueError(f'Không tìm thấy bản lưu: {path}')
-    try:df=pd.read_excel(path,sheet_name=SNAP_SHEET,dtype=str)
-    except Exception as e:raise ValueError(f'File "{path.name}" không phải bản lưu danh sách nhân sự (cần sheet {SNAP_SHEET}): {e}')
-    if 'MA_CCHN' not in df.columns and 'MA_TRA_CUU' not in df.columns:raise ValueError(f'Bản lưu "{path.name}" thiếu cột MA_CCHN.')
-    return _frame_to_records(df),_read_info(path)
 def list_snapshots(directory=None):
-    """Danh sách bản lưu trong thư mục, mới nhất trước: [{path,name,gphd,facility,saved_at,n,note}]."""
-    d=Path(directory) if directory else snapshot_dir();out=[]
-    for f in sorted(d.glob('*.xlsx'),key=lambda x:x.stat().st_mtime,reverse=True):
-        if f.name.endswith('.part.xlsx') or f.name.startswith('~$'):continue
-        i=_read_info(f)
-        if not i.get('GPHD'):continue
-        out.append(dict(path=str(f),name=f.name,gphd=i.get('GPHD',''),facility=i.get('TEN_CO_SO',''),saved_at=i.get('NGAY_LUU',''),n=i.get('SO_NHAN_SU',''),note=i.get('GHI_CHU','')))
+    """Bản lưu, mới nhất trước: [{path,name,gphd,facility,saved_at,n,note,hours}]."""
+    import syt_store
+    if directory:syt_store.set_base_dir(directory)
+    out=[]
+    for m in syt_store.list_snapshots():
+        out.append(dict(path=m['path'],name=Path(m['path']).name,gphd=m.get('gphd',''),facility=m.get('facility_name',''),
+                        saved_at=str(m.get('fetched_at','')),n=m.get('count',0),note='nhập Excel' if m.get('origin')=='import' else 'quét từ cổng',hours=m.get('hours','')))
     return out
 def delete_snapshot(path):
-    Path(path).unlink()
+    import syt_store;syt_store.delete_snapshot(path)
 def resolve_snapshot(cfg):
     """cfg['snapshot'] (đường dẫn hoặc tên file trong thư mục bản lưu) → Path hoặc None."""
+    import syt_store
     v=str(cfg.get('snapshot') or '').strip()
     if not v:return None
+    snapshot_dir(cfg)
     p=Path(v)
-    if not p.exists():p=snapshot_dir(cfg)/v
-    if not p.exists() and not p.name.lower().endswith('.xlsx'):p=snapshot_dir(cfg)/(v+'.xlsx')
+    if not p.exists():
+        for m in syt_store.list_snapshots():
+            if Path(m['path']).name==v or Path(m['path']).stem==v:p=Path(m['path']);break
     if not p.exists():raise ValueError(f'Không tìm thấy bản lưu danh sách nhân sự: {v}')
     return p
 def import_snapshot(xlsx,gphd='',directory=None):
-    """Thêm bản lưu từ 1 file Excel có sẵn (đúng định dạng bản lưu). GPHĐ lấy từ sheet THONG_TIN, không có thì từ tham số/cột CO_SO_GPHD."""
-    recs,info=read_snapshot(xlsx)
-    g=info.get('GPHD') or gphd
-    if not g:
-        gs=[w.gphd for r in recs.values() for w in r.workplaces if w.gphd]
-        g=max(set(gs),key=gs.count) if gs else ''
-    if not g:raise ValueError('Không xác định được số GPHĐ của bản lưu — hãy nhập GPHĐ rồi thử lại.')
-    return save_snapshot(recs,g,info.get('TEN_CO_SO',''),directory,note=info.get('GHI_CHU','') or f'nhập từ {Path(xlsx).name}')
+    """Thêm bản lưu từ file Excel theo bố cục mẫu của cổng (sheet "Thông tin chung" + "Nhân sự"). Trả đường dẫn bản lưu."""
+    import syt_store
+    if directory:syt_store.set_base_dir(directory)
+    p,err=syt_store.import_xlsx(xlsx,gphd,log=log)
+    if err:raise ValueError(err)
+    log(f'Đã nhập bản lưu: {p}');return p
+def export_snapshot(path,out_xlsx):
+    import syt_store;return syt_store.export_xlsx(path,out_xlsx)
 def download_snapshot(gphd,directory=None,cancelled=None):
-    """Tải danh sách nhân sự cơ sở từ web 1 và lưu thành bản lưu mới. Trả về đường dẫn file."""
-    import medinet_lookup as ML
+    """Quét danh sách nhân sự cơ sở từ cổng và lưu thành bản lưu mới (giữ cả "Thời gian hoạt động" của cơ sở). Trả đường dẫn."""
+    import syt_store
     if not str(gphd or '').strip():raise ValueError('Chưa nhập số giấy phép hoạt động (GPHĐ) của cơ sở.')
-    recs,err=ML.fetch_facility_staff(gphd,log=log,cancelled=cancelled or cancelled_flag,use_cache=False)
-    if err or not recs:raise RuntimeError(err or 'Không lấy được danh sách nhân sự.')
-    p=save_snapshot(recs,gphd,directory=directory,note='tải từ web')
+    if directory:syt_store.set_base_dir(directory)
+    p,err=syt_store.scan(gphd,log=log,cancelled=cancelled or cancelled_flag)
+    if err or not p:raise RuntimeError(err or 'Không lấy được danh sách nhân sự.')
     log(f'Đã lưu bản lưu: {p}');return p
 cancelled_flag=cancelled
 
@@ -818,10 +703,9 @@ def parse_args(argv=None):
     a('--pair2',nargs=2,metavar=('COT_MA','COT_TG'),help='cặp 2 (mặc định MA_BSI_THUC_HIEN NGAY_TH_YL, tự bật nếu .db có đủ 2 cột)')
     a('--no-pair1',action='store_true',help='tắt cặp 1');a('--no-pair2',action='store_true',help='tắt cặp 2')
     a('--loai-kcb',dest='loai_kcb',help='chỉ xét các loại hình KCB (MA_LOAI_KCB), vd "01,03"; mặc định tất cả')
-    a('--snapshot',help='dùng lại bản lưu danh sách nhân sự (đường dẫn .xlsx hoặc tên file trong thư mục bản lưu) — không tải lại từ web')
+    a('--snapshot',help='dùng lại bản lưu danh sách nhân sự (đường dẫn .json hoặc tên file trong thư mục bản lưu) — không tải lại từ web')
     a('--snapshot-dir',dest='snapshot_dir',help='thư mục chứa các bản lưu (mặc định <thư mục script>/ban_luu_cchn)')
     a('--offline',action='store_true',help='CHỈ dùng bản lưu (--snapshot), KHÔNG kết nối mạng, không cần --gphd')
-    a('--refresh-snapshot',dest='snapshot_refresh',action='store_true',help='có bản lưu nhưng vẫn tải lại danh sách cơ sở từ web để cập nhật thêm vào bản lưu')
     a('--list-snapshots',action='store_true',help='liệt kê các bản lưu rồi thoát')
     a('--download-snapshot',action='store_true',help='chỉ tải danh sách nhân sự của cơ sở (--gphd) từ web và lưu thành bản lưu mới, rồi thoát')
     a('--delete-snapshot',metavar='TEN',help='xoá 1 bản lưu rồi thoát')
@@ -848,7 +732,6 @@ def build_cfg(args):
     if args.no_pair2:cfg['pair2_on']=False
     if args.loai_kcb:cfg['loai_kcb']=args.loai_kcb
     if args.offline:cfg['offline']=True
-    if args.snapshot_refresh:cfg['snapshot_refresh']=True
     if args.web1_safe:cfg['web1_safe']=True
     if args.ssd:cfg['ssd']=True
     if args.no_cache:cfg['cache']=False

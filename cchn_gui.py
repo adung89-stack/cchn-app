@@ -16,8 +16,10 @@ from PySide6.QtCore import Qt,QObject,QThread,Signal,QSettings,QUrl
 from PySide6.QtGui import QDesktopServices,QFont,QTextCursor
 from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,
     QMainWindow,QMessageBox,QPlainTextEdit,QProgressBar,QPushButton,QRadioButton,QVBoxLayout,QWidget,QButtonGroup,QDialog,QTableWidget,
-    QTableWidgetItem,QAbstractItemView,QHeaderView)
+    QTableWidgetItem,QAbstractItemView,QHeaderView,QScrollArea,QSpinBox,QFrame)
+from PySide6.QtGui import QShortcut,QKeySequence,QGuiApplication
 import cchn_verify as CV
+import medinet_lookup as ML
 if not hasattr(CV,'LOGGER') or not hasattr(CV,'run'):
     _m=(f'File "{getattr(CV,"__file__","cchn_verify.py")}" KHÔNG phải bản logic của cchn_verify.py '
         '(có thể đã lưu nhầm nội dung cchn_gui.py đè lên tên cchn_verify.py).\n'
@@ -60,30 +62,69 @@ class Task(QThread):
         except BaseException as e:
             e._tb=traceback.format_exc();self.done.emit(None,e)
 
+def _avail():
+    """Vùng làm việc của màn hình đang dùng (đã trừ thanh tác vụ/Dock)."""
+    sc=QGuiApplication.primaryScreen();return sc.availableGeometry() if sc else None
+def fit_size(w,h,frac=0.94):
+    """Kích thước cửa sổ không vượt quá vùng làm việc của màn hình (laptop nhỏ / MacBook Air)."""
+    a=_avail()
+    if a is None:return w,h
+    return min(w,int(a.width()*frac)),min(h,int(a.height()*frac))
+BASE_PT=[0.0]
+def apply_zoom(pct):
+    """Thu/phóng toàn bộ giao diện bằng cỡ chữ (mọi nút, ô nhập, bảng, log co giãn theo)."""
+    pct=max(60,min(160,int(pct)))
+    app=QApplication.instance();f=app.font()
+    if not BASE_PT[0]:BASE_PT[0]=f.pointSizeF() if f.pointSizeF()>0 else 10.0
+    f.setPointSizeF(BASE_PT[0]*pct/100.0);app.setFont(f);return pct
+def auto_zoom():
+    """Mặc định theo màn hình: màn hình thấp thì tự thu nhỏ để thấy đủ."""
+    a=_avail()
+    if a is None:return 100
+    h=a.height()
+    return 100 if h>=900 else 90 if h>=800 else 80 if h>=720 else 70
+
+def wrap_text(t,width=52):
+    """Ngắt dòng tại khoảng trắng để nhãn dài (checkbox/radio) không làm cửa sổ rộng ra."""
+    if '\n' in t or len(t)<=width:return t
+    out=[];cur=''
+    for w in t.split(' '):
+        if cur and len(cur)+1+len(w)>width:out.append(cur);cur=w
+        else:cur=(cur+' '+w) if cur else w
+    out.append(cur);return '\n'.join(out)
+def wrap_labels(root,width=52):
+    for T in (QCheckBox,QRadioButton):
+        for c in root.findChildren(T):
+            t=c.text()
+            if len(t)>width and '\n' not in t:
+                if not c.toolTip():c.setToolTip(t)
+                c.setText(wrap_text(t,width))
+
 class SnapDialog(QDialog):
-    """Quản lý các bản lưu danh sách nhân sự cơ sở (Excel): xem, tải mới từ web, thêm từ file Excel, xoá, chọn dùng."""
+    """Quản lý các bản lưu danh sách nhân sự cơ sở (dùng chung định dạng với app chính): xem, quét mới từ cổng, nhập/xuất Excel, xoá, chọn dùng."""
     HEAD=['Tên file','GPHĐ','Cơ sở','Lưu lúc','Số nhân sự','Ghi chú']
     def __init__(self,parent,gphd,directory_cfg):
-        super().__init__(parent);self.setWindowTitle('Bản lưu danh sách nhân sự cơ sở');self.resize(900,460)
+        super().__init__(parent);self.setWindowTitle('Bản lưu danh sách nhân sự cơ sở');self.resize(*fit_size(900,460))
         self.cfg=directory_cfg;self.chosen=None;self.busy=False;self.rows=[]
         v=QVBoxLayout(self)
-        v.addWidget(QLabel('Mỗi bản lưu là 1 file Excel danh sách nhân sự của cơ sở. Chọn bản lưu khi chạy để KHÔNG phải tải lại từ web (hạn chế bị chặn). '
-                           'Các mã tra lẻ thêm trong lúc chạy cũng được ghi bổ sung vào bản lưu đang dùng.'))
+        v.addWidget(QLabel('Mỗi bản lưu là danh sách nhân sự + "Thời gian hoạt động" của cơ sở tại thời điểm quét. Chọn bản lưu khi chạy để KHÔNG phải tải lại từ web (hạn chế bị chặn). '
+                           'Quét mới / nhập Excel không ghi đè bản nào; chỉ xoá khi bạn bấm Xoá. Excel nhập/xuất theo bố cục file mẫu của cổng (sheet "Thông tin chung" + "Nhân sự").'))
         self.tbl=QTableWidget(0,len(self.HEAD));self.tbl.setHorizontalHeaderLabels(self.HEAD);self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setSelectionMode(QAbstractItemView.SingleSelection);self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive);self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setColumnWidth(0,300);self.tbl.setColumnWidth(1,120);self.tbl.setColumnWidth(2,150);self.tbl.setColumnWidth(3,140);self.tbl.setColumnWidth(4,80)
         self.tbl.doubleClicked.connect(self.use);v.addWidget(self.tbl,1)
         h=QHBoxLayout();h.addWidget(QLabel('GPHĐ cơ sở:'));self.gphd=QLineEdit(gphd);self.gphd.setPlaceholderText('vd: 01366/HCM-GPHĐ');h.addWidget(self.gphd,1)
-        self.b_dl=QPushButton('⬇ Tải mới từ web và lưu');self.b_dl.clicked.connect(self.download);h.addWidget(self.b_dl)
+        self.b_dl=QPushButton('⬇ Quét mới từ cổng và lưu');self.b_dl.clicked.connect(self.download);h.addWidget(self.b_dl)
         self.b_stop=QPushButton('⏹ Dừng tải');self.b_stop.setEnabled(False);self.b_stop.clicked.connect(lambda:CV._CANCEL.set());h.addWidget(self.b_stop);v.addLayout(h)
         h=QHBoxLayout()
-        self.b_imp=QPushButton('📥 Thêm từ file Excel...');self.b_imp.clicked.connect(self.import_file)
+        self.b_imp=QPushButton('📥 Nhập từ Excel...');self.b_imp.clicked.connect(self.import_file)
+        self.b_exp=QPushButton('📤 Xuất ra Excel...');self.b_exp.clicked.connect(self.export_file)
         self.b_del=QPushButton('🗑 Xoá bản đã chọn');self.b_del.clicked.connect(self.delete)
         self.b_dir=QPushButton('📁 Mở thư mục');self.b_dir.clicked.connect(self.open_dir)
         self.b_use=QPushButton('✔ Dùng bản đã chọn');self.b_use.clicked.connect(self.use);self.b_use.setStyleSheet('font-weight:bold')
         b_close=QPushButton('Đóng');b_close.clicked.connect(self.reject)
-        for b in (self.b_imp,self.b_del,self.b_dir):h.addWidget(b)
+        for b in (self.b_imp,self.b_exp,self.b_del,self.b_dir):h.addWidget(b)
         h.addStretch(1);h.addWidget(self.b_use);h.addWidget(b_close);v.addLayout(h)
         self.status=QLabel('');v.addWidget(self.status);self.refresh()
     def refresh(self,select=None):
@@ -99,7 +140,7 @@ class SnapDialog(QDialog):
         i=self.tbl.currentRow();return self.rows[i] if 0<=i<len(self.rows) else None
     def set_busy(self,b):
         self.busy=b
-        for w in (self.b_dl,self.b_imp,self.b_del,self.b_dir,self.b_use,self.tbl,self.gphd):w.setEnabled(not b)
+        for w in (self.b_dl,self.b_imp,self.b_exp,self.b_del,self.b_dir,self.b_use,self.tbl,self.gphd):w.setEnabled(not b)
         self.b_stop.setEnabled(b and self._can_stop)
     _can_stop=False
     def _run(self,fn,done,can_stop=False):
@@ -108,7 +149,7 @@ class SnapDialog(QDialog):
     def download(self):
         g=self.gphd.text().strip()
         if not g:QMessageBox.information(self,'Bản lưu','Hãy nhập số GPHĐ của cơ sở.');return
-        self.status.setText('Đang tải danh sách nhân sự từ web... (xem tiến trình ở khung log chính)')
+        self.status.setText('Đang quét danh sách nhân sự từ cổng... (xem tiến trình ở khung log chính)')
         def done(r,e):
             if e is not None:
                 if CV.cancelled():self.status.setText('Đã dừng tải.');return
@@ -116,13 +157,21 @@ class SnapDialog(QDialog):
             self.refresh(select=str(r));self.status.setText('Đã tải và lưu bản mới.')
         self._run(lambda:CV.download_snapshot(g,CV.snapshot_dir(self.cfg)),done,can_stop=True)
     def import_file(self):
-        p,_=QFileDialog.getOpenFileName(self,'Chọn file Excel bản lưu danh sách nhân sự','','Excel (*.xlsx)')
+        p,_=QFileDialog.getOpenFileName(self,'Chọn file Excel danh sách nhân sự (bố cục mẫu của cổng)','','Excel (*.xlsx *.xlsm)')
         if not p:return
         g=self.gphd.text().strip()
         def done(r,e):
             if e is not None:QMessageBox.warning(self,'Bản lưu',f'Không thêm được: {e}');return
             self.refresh(select=str(r));self.status.setText('Đã thêm bản lưu từ file Excel.')
         self._run(lambda:CV.import_snapshot(p,g,CV.snapshot_dir(self.cfg)),done)
+    def export_file(self):
+        r=self.current()
+        if not r:return
+        import syt_store
+        fn,_=QFileDialog.getSaveFileName(self,'Xuất bản lưu ra Excel',syt_store.default_export_name(syt_store.read_meta(r['path']) or {}),'Excel (*.xlsx)')
+        if not fn:return
+        try:CV.export_snapshot(r['path'],fn);self.status.setText(f'Đã xuất: {fn}')
+        except Exception as e:QMessageBox.warning(self,'Bản lưu',f'Không xuất được: {e}')
     def delete(self):
         r=self.current()
         if not r:return
@@ -137,16 +186,25 @@ class SnapDialog(QDialog):
 
 class Win(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Xác thực CCHN (mục F) — độc lập');self.resize(980,860)
+        super().__init__();self.setWindowTitle('Xác thực CCHN (mục F) — độc lập');self.resize(*fit_size(980,860))
         self.st=QSettings('GeneralDataProcessor','cchn_gui');self.columns=[];self.task=None;self.run_busy=False;self.last_dir=''
-        self._build();self._wire_log();self._restore()
+        self._build();wrap_labels(self);self._wire_log();self._restore()
     # ---------------- giao diện ----------------
     def _row_file(self,label,edit,btn_text,slot,ph=''):
         b=QPushButton(btn_text);b.clicked.connect(slot);edit.setPlaceholderText(ph);return b
     def _combo(self):
         c=QComboBox();c.setEditable(False);c.setMinimumWidth(170);return c
     def _build(self):
-        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root)
+        root=QWidget();v=QVBoxLayout(root)
+        # cuộn được khi màn hình nhỏ: không bao giờ mất phần dưới/bên phải; thu/phóng ở góc trên (hoặc Ctrl +/-/0)
+        sa=QScrollArea();sa.setWidgetResizable(True);sa.setFrameShape(QFrame.NoFrame);sa.setWidget(root);self.setCentralWidget(sa);self.scroll=sa
+        self.zoom_sb=QSpinBox();self.zoom_sb.setRange(60,160);self.zoom_sb.setSingleStep(10);self.zoom_sb.setSuffix(' %');self.zoom_sb.setToolTip('Thu/phóng giao diện (Ctrl + / Ctrl - / Ctrl 0)')
+        self.zoom_sb.valueChanged.connect(self.set_zoom)
+        zl=QLabel('🔍 Thu/phóng:');zb=QPushButton('Tự động');zb.clicked.connect(lambda:self.zoom_sb.setValue(auto_zoom()))
+        zh=QHBoxLayout();zh.addStretch(1);zh.addWidget(zl);zh.addWidget(self.zoom_sb);zh.addWidget(zb);v.addLayout(zh)
+        for k,fn in (('Ctrl+=',lambda:self.zoom_sb.setValue(self.zoom_sb.value()+10)),('Ctrl++',lambda:self.zoom_sb.setValue(self.zoom_sb.value()+10)),
+                     ('Ctrl+-',lambda:self.zoom_sb.setValue(self.zoom_sb.value()-10)),('Ctrl+0',lambda:self.zoom_sb.setValue(100))):
+            QShortcut(QKeySequence(k),self,activated=fn)
         # 1. Nguồn
         g=QGroupBox('1. Nguồn dữ liệu (.db)');f=QGridLayout(g)
         self.db_edit=QLineEdit();self.db_edit.setReadOnly(True)
@@ -174,20 +232,18 @@ class Win(QMainWindow):
         f.addWidget(QLabel('Số GPHĐ bệnh viện'),2,0);f.addWidget(self.gphd_edit,2,1)
         f.setColumnStretch(1,1);v.addWidget(g)
         # 3a. Bản lưu danh sách nhân sự
-        g=QGroupBox('Bản lưu danh sách nhân sự cơ sở (dùng lại, khỏi tải web — hạn chế bị chặn)');f=QGridLayout(g)
+        g=QGroupBox('Bản lưu danh sách nhân sự cơ sở (dùng lại, khỏi tải web)');f=QGridLayout(g)
         self.snap_cb=QComboBox();self.snap_cb.setMinimumWidth(420);self.snap_cb.currentIndexChanged.connect(self.on_snap_changed)
         f.addWidget(QLabel('Nguồn danh sách'),0,0);f.addWidget(self.snap_cb,0,1)
         mb=QPushButton('⚙ Quản lý bản lưu (tải mới / thêm / xoá)...');mb.clicked.connect(self.manage_snaps);f.addWidget(mb,0,2)
         self.offline_cb=QCheckBox('Chỉ dùng bản lưu — KHÔNG kết nối mạng (offline), không cần nhập GPHĐ')
         self.offline_cb.setToolTip('Tra cứu hoàn toàn từ bản lưu. Mã bác sĩ không có trong bản lưu sẽ không được tra web (xem như chưa có dữ liệu).')
         self.offline_cb.toggled.connect(self.on_snap_changed);f.addWidget(self.offline_cb,1,0,1,3)
-        self.refresh_cb=QCheckBox('Cập nhật thêm: tải lại danh sách cơ sở từ web và gộp vào bản lưu (cần mạng)')
-        f.addWidget(self.refresh_cb,2,0,1,3)
-        hint=QLabel('Chọn "Tải mới từ web" thì danh sách được tải rồi tự lưu thành bản mới; lần sau chọn bản đó. Có bản lưu thì GPHĐ để trống cũng được (lấy từ bản lưu); '
-                    'không tick offline thì mã chưa có trong bản lưu vẫn được tra web và ghi bổ sung vào bản lưu.')
+        hint=QLabel('Chọn "Tự động": dùng bản quét ≤30 ngày của GPHĐ, chưa có thì tự quét 1 bản mới và lưu. Chọn 1 bản lưu cụ thể thì chạy theo bản đó (GPHĐ để trống cũng được); '
+                    'tích offline thì tuyệt đối không kết nối mạng (mã chưa có trong bản lưu coi như chưa có dữ liệu).')
         hint.setWordWrap(True);f.addWidget(hint,3,0,1,3);f.setColumnStretch(1,1);v.addWidget(g)
         # 3b. Loại hình KCB
-        g=QGroupBox('Loại hình khám bệnh, chữa bệnh (MA_LOAI_KCB) — tích chọn nhiều loại; bỏ trống hết = xuất tất cả');f=QGridLayout(g)
+        g=QGroupBox('Loại hình KCB (MA_LOAI_KCB) — tích nhiều loại; bỏ trống = xuất tất cả');f=QGridLayout(g)
         self.kcb_cbs={}
         for i,(k,lab) in enumerate(CV.LOAI_KCB.items()):
             short=lab.replace(' (theo TT 46/2016/TT-BYT)','').replace(' liên tục trong năm','')
@@ -208,6 +264,16 @@ class Win(QMainWindow):
         self.cache=QCheckBox('Tạo cache Parquet tạm cho .db ≥ 50MB (xoá khi xong; thường không cần)');self.cache.setChecked(False)
         for w in (self.overwrite,self.ssd,self.cache):h.addWidget(w)
         h.addStretch(1);f.addLayout(h);v.addWidget(g)
+        # 5. Đối chiếu file DM nhân viên do đơn vị gửi với SYT (không cần .db)
+        g=QGroupBox('5. Đối chiếu file DM nhân viên đơn vị gửi với SYT (không cần .db)');f=QGridLayout(g)
+        self.sc_file='';self.sc_label=QLabel('(chưa chọn file)');self.sc_label.setWordWrap(True)
+        b=QPushButton('📂 Chọn file DM nhân viên của đơn vị...');b.clicked.connect(self.pick_sc_file);f.addWidget(b,0,0);f.addWidget(self.sc_label,0,1,1,2)
+        self.sc_key=self._combo();self.sc_key.addItem('(chọn file trước)','')
+        f.addWidget(QLabel('Cột mã CCHN (file đơn vị gửi)'),1,0);f.addWidget(self.sc_key,1,1)
+        self.sc_fresh=QCheckBox('Quét lại danh sách nhân sự từ cổng trước khi đối chiếu (bỏ qua nếu đã chọn 1 bản lưu cụ thể ở mục 3 — khi đó chạy offline)');f.addWidget(self.sc_fresh,2,0,1,3)
+        self.sc_btn=QPushButton('🔎 Đối chiếu với SYT → xuất file đơn vị + cột đối chiếu (ô sai tô đỏ)');self.sc_btn.clicked.connect(self.run_sc);f.addWidget(self.sc_btn,3,0,1,3)
+        self.sc_status=QLabel('');self.sc_status.setWordWrap(True);f.addWidget(self.sc_status,4,0,1,3)
+        f.setColumnStretch(1,1);v.addWidget(g)
         # chạy
         h=QHBoxLayout();self.run_btn=QPushButton('▶ Xác thực CCHN');self.run_btn.setMinimumHeight(36);self.run_btn.setStyleSheet('font-weight:bold')
         self.run_btn.clicked.connect(self.start)
@@ -216,7 +282,7 @@ class Win(QMainWindow):
         h.addWidget(self.run_btn,2);h.addWidget(self.stop_btn,1);h.addWidget(self.open_btn,1);v.addLayout(h)
         self.bar=QProgressBar();self.bar.setRange(0,1);self.bar.setTextVisible(False);self.bar.setMaximumHeight(8);v.addWidget(self.bar)
         self.log_view=QPlainTextEdit();self.log_view.setReadOnly(True);self.log_view.setMaximumBlockCount(20000)
-        fnt=QFont('Consolas');fnt.setStyleHint(QFont.Monospace);fnt.setPointSize(9);self.log_view.setFont(fnt)
+        fnt=QFont('Consolas');fnt.setStyleHint(QFont.Monospace);fnt.setPointSize(9);self.log_view.setFont(fnt);self.log_view.setMinimumHeight(170)
         v.addWidget(QLabel('Log (đồng thời ghi vào file <kết quả>_log.txt):'));v.addWidget(self.log_view,1)
     def _wire_log(self):
         self.qh=QtLogHandler();self.qh.line.connect(self.append_log);CV.LOGGER.setLevel(logging.INFO);CV.LOGGER.propagate=False
@@ -227,11 +293,11 @@ class Win(QMainWindow):
     # ---------------- bản lưu danh sách nhân sự ----------------
     def refresh_snaps(self,select=None):
         sel=select if select is not None else (self.snap_cb.currentData() or '')
-        self.snap_cb.blockSignals(True);self.snap_cb.clear();self.snap_cb.addItem('🌐 Tải mới từ web (tự lưu thành bản mới)','')
+        self.snap_cb.blockSignals(True);self.snap_cb.clear();self.snap_cb.addItem('🌐 Tự động (dùng bản ≤30 ngày, chưa có thì quét mới)','')
         try:rows=CV.list_snapshots(CV.snapshot_dir())
         except Exception:rows=[]
         self._snaps={r['path']:r for r in rows}
-        for r in rows:self.snap_cb.addItem(f"📄 {r['facility'] or r['gphd']} · {r['gphd']} · {r['saved_at'][:16]} · {r['n']} người",r['path'])
+        for r in rows:self.snap_cb.addItem(f"📄 {r['facility'] or r['gphd']} · {r['gphd']} · {r['saved_at'][:16].replace('T',' ')} · {r['n']} người",r['path'])
         i=self.snap_cb.findData(sel);self.snap_cb.setCurrentIndex(i if i>=0 else 0);self.snap_cb.blockSignals(False);self.on_snap_changed()
     def on_snap_changed(self,_=None):
         r=self._snaps.get(self.snap_cb.currentData() or '')
@@ -239,18 +305,24 @@ class Win(QMainWindow):
         self.offline_cb.setEnabled(has)
         if not has:self.offline_cb.blockSignals(True);self.offline_cb.setChecked(False);self.offline_cb.blockSignals(False)
         off=has and self.offline_cb.isChecked()
-        self.refresh_cb.setEnabled(has and not off)
-        if not has or off:self.refresh_cb.setChecked(False)
         self.gphd_edit.setEnabled(not off)
         self.gphd_edit.setPlaceholderText(f'(để trống = dùng GPHĐ của bản lưu: {r["gphd"]})' if has else 'vd: 01366/HCM-GPHĐ')
     def manage_snaps(self):
         d=SnapDialog(self,self.gphd_edit.text().strip(),{})
         if d.exec()==QDialog.Accepted and d.chosen:self.refresh_snaps(select=d.chosen['path'])
         else:self.refresh_snaps()
-        self.on_snap_changed()
+        wrap_labels(self);self.on_snap_changed()
+    def set_zoom(self,pct):
+        p=apply_zoom(pct)
+        if self.zoom_sb.value()!=p:self.zoom_sb.setValue(p)
+        # bố cục tự tính lại theo cỡ chữ mới; cửa sổ không vượt quá màn hình
+        self.resize(*fit_size(self.width(),self.height()))
     # ---------------- lưu/khôi phục ----------------
     def _restore(self):
         g=lambda k:self.st.value(k,'') or ''
+        try:z=int(g('zoom') or 0)
+        except ValueError:z=0
+        self.zoom_sb.setValue(z if 60<=z<=160 else auto_zoom())
         self.gphd_edit.setText(g('gphd'));self.last_dir=g('last_dir')
         self.refresh_snaps(select=g('snapshot'));self.offline_cb.setChecked(g('offline')=='1');self.on_snap_changed()
         sf=g('staff_file')
@@ -259,7 +331,7 @@ class Win(QMainWindow):
         if self.run_busy:
             if QMessageBox.question(self,'Đang chạy','Đang xác thực — thoát sẽ huỷ lượt chạy. Thoát?')!=QMessageBox.Yes:e.ignore();return
             self.stop()
-        for k,v in (('gphd',self.gphd_edit.text()),('staff_file',self.staff_edit.text()),('key_col',self.key_cb.currentData() or self.key_cb.currentText()),('last_dir',self.last_dir),('snapshot',self.snap_cb.currentData() or ''),('offline','1' if self.offline_cb.isChecked() else '0')):self.st.setValue(k,v)
+        for k,v in (('gphd',self.gphd_edit.text()),('staff_file',self.staff_edit.text()),('key_col',self.key_cb.currentData() or self.key_cb.currentText()),('last_dir',self.last_dir),('snapshot',self.snap_cb.currentData() or ''),('offline','1' if self.offline_cb.isChecked() else '0'),('zoom',str(self.zoom_sb.value()))):self.st.setValue(k,v)
         e.accept()
     # ---------------- chọn file ----------------
     def _start_dir(self):return self.last_dir if self.last_dir and Path(self.last_dir).exists() else ''
@@ -321,8 +393,42 @@ class Win(QMainWindow):
             pair1_on=self.p1_on.isChecked(),pair1_doctor=self.p1_doc.currentText(),pair1_time=self.p1_time.currentText(),
             pair2_on=self.p2_on.isChecked(),pair2_doctor=self.p2_doc.currentText(),pair2_time=self.p2_time.currentText(),
             loai_kcb=[k for k,c in self.kcb_cbs.items() if c.isChecked()],web1_safe=self.web1_safe.isChecked(),
-            snapshot=self.snap_cb.currentData() or '',offline=self.offline_cb.isChecked(),snapshot_refresh=self.refresh_cb.isChecked(),ssd=self.ssd.isChecked(),cache=self.cache.isChecked(),overwrite=self.overwrite.isChecked())
+            snapshot=self.snap_cb.currentData() or '',offline=self.offline_cb.isChecked(),ssd=self.ssd.isChecked(),cache=self.cache.isChecked(),overwrite=self.overwrite.isChecked())
         return c
+    # ---------------- đối chiếu file DM nhân viên đơn vị gửi ----------------
+    def pick_sc_file(self):
+        p,_=QFileDialog.getOpenFileName(self,'Chọn file DM nhân viên do đơn vị gửi',self.last_dir,'Excel (*.xlsx)')
+        if not p:return
+        try:cols=[str(c) for c in ML._read_staff_dir_df(Path(p)).columns]
+        except Exception as e:QMessageBox.warning(self,'Đối chiếu',f'Không đọc được file: {e}');return
+        need=[c for c in ('THOIGIAN_NGAY','THOIGIAN_TUAN','TU_NGAY') if c not in cols]
+        if need:QMessageBox.information(self,'Đối chiếu','File thiếu cột '+', '.join(need)+' nên chỉ đối chiếu được các phần còn lại (có thể bạn chọn nhầm file FileDM_NHANVIENYTE).')
+        self.sc_file=p;self.last_dir=str(Path(p).parent);self.sc_label.setText(Path(p).name)
+        self.sc_key.clear();self.sc_key.addItems(cols)
+        if 'MACCHN' in cols:self.sc_key.setCurrentText('MACCHN')
+    def run_sc(self):
+        if self.run_busy:return
+        if not self.sc_file:QMessageBox.information(self,'Đối chiếu','Hãy chọn file DM nhân viên của đơn vị trước.');return
+        key=self.sc_key.currentText()
+        if not key or key.startswith('('):QMessageBox.information(self,'Đối chiếu','Hãy chọn cột mã CCHN.');return
+        g=self.gphd_edit.text().strip();snap=self.snap_cb.currentData() or ''
+        if not g and not snap:QMessageBox.information(self,'Đối chiếu','Hãy nhập GPHĐ của cơ sở hoặc chọn 1 bản lưu danh sách nhân sự.');return
+        import staff_syt_check
+        CV._CANCEL.clear();reset_file_logging();self.set_busy(True);self.sc_status.setText('Đang đối chiếu...')
+        def work():
+            CV.snapshot_dir();ML.set_cache_dir(CV.snapshot_dir())
+            try:return staff_syt_check.run(self.sc_file,key,g,snapshot=snap,fresh=self.sc_fresh.isChecked(),log=CV.log,cancelled=CV.cancelled)
+            finally:ML.set_offline(False);ML.set_facility_snapshot('')
+        def done(r,e):
+            self.set_busy(False)
+            if e is not None:self.sc_status.setText('Lỗi: '+str(e));QMessageBox.warning(self,'Đối chiếu',str(e));return
+            out,st,err=r
+            if err:self.sc_status.setText('Lỗi: '+err);QMessageBox.warning(self,'Đối chiếu',err);return
+            self.refresh_snaps(select=snap or None)
+            m=(f"Đã xuất: {out}\nTổng {st.get('tong',0)} dòng — khớp {st.get('khop',0)}, có sai lệch {st.get('co_loi',0)} "
+               f"(không có trên SYT/cơ sở: {st.get('khong_co_syt',0)}); SYT đang làm nhưng danh mục thiếu: {st.get('syt_thieu_trong_dm',0)}.")
+            self.sc_status.setText(m);self.last_out=str(Path(out).parent);self.open_btn.setEnabled(True);QMessageBox.information(self,'Đối chiếu',m)
+        self.sc_task=Task(work);self.sc_task.done.connect(done);self.sc_task.start()
     def set_busy(self,b):
         self.run_busy=b
         for w in (self.run_btn,):w.setEnabled(not b)
