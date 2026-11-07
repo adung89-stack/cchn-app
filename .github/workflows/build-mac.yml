@@ -29,7 +29,7 @@ jobs:
       - name: Build app
         run: |
           pyinstaller --noconfirm --windowed --name CCHN \
-            --hidden-import medinet_lookup --hidden-import cchn_verify \
+            --hidden-import medinet_lookup --hidden-import syt_store --hidden-import staff_syt_check --hidden-import cchn_verify \
             --collect-all duckdb --collect-submodules bs4 \
             cchn_gui.py
 
